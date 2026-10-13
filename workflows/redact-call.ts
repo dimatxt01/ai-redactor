@@ -7,7 +7,7 @@
 // AssemblyAI's copies; TR's bridge purges scratch + partial artifacts.
 import { createWebhook, getWorkflowMetadata, sleep } from "workflow";
 import { start } from "workflow/api";
-import { LIMITS, MODELS, PIPELINE_VERSION } from "@/lib/config";
+import { LIMITS, MODELS, PIPELINE_VERSION, RUN_OPTIONS } from "@/lib/config";
 import { codeFromError, jobError } from "@/lib/errors";
 import {
   asrStatus, claimJob, clipsAndCoaching, completeJob, detectPii, failJob, fetchSource, purgeAsr, purgeJobs, renderAudio, savePass1,
@@ -107,7 +107,7 @@ export async function redactCall(jobId: string, idempotencyKey: string) {
     if (!stopped) await failJob(jobId, runId, code, detail);
     await purgeJobs([jobId]);
     // An upload signed before the failure can still land for ~2h: purge again after every signed URL expired.
-    await start(purgeLater, [[jobId]]);
+    await start(purgeLater, [[jobId]], RUN_OPTIONS);
     return stopped ? { status: "stopped" as const } : { status: "failed" as const, error_code: code };
   }
 }

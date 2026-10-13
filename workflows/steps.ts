@@ -1,7 +1,7 @@
 // Steps of the redaction workflow. Each step does its own I/O (bridge, vendors,
 // ffmpeg) and passes ONLY non-PII values onward: ids, counts, hashes, millisecond
 // offsets, detector/type names. Transcripts and names live in TR's private
-// sample-work bucket between steps and in local /tmp inside one step (removed in
+// sample-src/<job_id>/ scratch prefix between steps and in local /tmp inside one step (removed in
 // `finally`), so the workflow event log never holds personal data.
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

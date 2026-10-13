@@ -4,6 +4,7 @@
 import { start } from "workflow/api";
 import { verifySignature } from "@/lib/signature";
 import { log } from "@/lib/log";
+import { RUN_OPTIONS } from "@/lib/config";
 import { redactCall } from "@/workflows/redact-call";
 
 export async function POST(req: Request) {
@@ -21,7 +22,7 @@ export async function POST(req: Request) {
   const key = String(body.idempotency_key ?? "");
   if (!/^call:[0-9a-f-]{36}:v\d+$/.test(key)) return Response.json({ error: "idempotency_key required" }, { status: 400 });
   // the run's claim checks this key against the job row (bridge), so a signed start can't pair a job with another key
-  const run = await start(redactCall, [jobId, key]);
+  const run = await start(redactCall, [jobId, key], RUN_OPTIONS);
   log("run_started", { job_id: jobId, run_id: run.runId, key });
   return Response.json({ run_id: run.runId }, { status: 202 });
 }

@@ -2,6 +2,7 @@
 // it is sample-exact and testable; ffmpeg does decode, channel split, the
 // customer pitch-shift, the mono mix and encoding.
 import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import ffmpegStatic from "ffmpeg-static";
@@ -44,6 +45,22 @@ export async function probe(file: string): Promise<Probe> {
     bitrateKbps: br ? Number(br[1]) : null,
     codec: a[1],
   };
+}
+
+/** Health: is the bundled binary there, and does it run on this platform? (proves ffmpeg-static shipped) */
+export function ffmpegInfo(): Promise<{ ok: boolean; version: string | null; bytes: number | null; platform: string }> {
+  const bin = ffmpegPath();
+  let bytes: number | null = null;
+  try { bytes = statSync(bin).size; } catch { /* missing */ }
+  return new Promise((resolve) => {
+    const done = (version: string | null) => resolve({ ok: !!version, version, bytes, platform: `${process.platform}-${process.arch}` });
+    if (bytes === null) return done(null);
+    const p = spawn(bin, ["-hide_banner", "-version"], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.on("close", (code) => done(code === 0 ? (/^ffmpeg version (\S+)/.exec(out)?.[1] ?? "unknown") : null));
+    p.on("error", () => done(null));
+  });
 }
 
 let filterList: Promise<string> | null = null;

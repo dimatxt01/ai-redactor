@@ -1,12 +1,12 @@
 # True Ring side: Training Recording Library, PR plan v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers)
 
 **Ask:** a "Recording Library" tab for **internal training**. It holds smart clips of the key Final Expense sale moments (opener, discovery, objection handling, close, …), each with an AI coaching note, plus a coaching summary per call. AMs and admins pick calls manually; which agents is TBD.
-Assumes the service in `SPEC.md` v0.2 is done. Planning only; nothing built.
+Contract: `SPEC.md` v0.2 (delivery revised 2026-10-13: pull through the bridge). Status: RL-1 applied; RL-2, RL-3, the staff part of RL-4 and RL-5 built on `feat/sample-redaction`, not deployed.
 
 **Revised 2026-10-13 (Dmitry): the service is built in-house, without n8n** — the worker is its own repo, `ai-redactor` (Vercel Workflow + ffmpeg), deployed separately; this branch (`feat/sample-redaction`) holds only the TR side: migration, `training-library-admin`, `sample-redaction-bridge`, the curation page.
 It keeps no copies, so the **signed callback (RL-3) is replaced by a bridge**. The worker reads its inputs and writes its results
 through ONE HMAC edge function, `sample-redaction-bridge`, straight into the RL-1 buckets. TR copies nothing, the service retains
-nothing, and the 7-day service-side retention and `DELETE /jobs/:id` callback are moot. `training-library-admin`'s delete removes
+nothing, and SPEC no longer has a callback, a 7-day service-side retention or `DELETE /jobs/:id` (removed 2026-10-13). `training-library-admin`'s delete removes
 every copy, including AssemblyAI's. Every result and job row carries `schema_version` "1.0" (SPEC §7). Rows 2–5 below are updated to match.
 
 ## Where the tab goes (read-only check)

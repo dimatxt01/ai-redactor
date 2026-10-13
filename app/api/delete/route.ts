@@ -12,6 +12,7 @@ import { purgeLater } from "@/workflows/redact-call";
 import { deleteTranscript } from "@/lib/assemblyai";
 import { verifySignature } from "@/lib/signature";
 import { errorCode, log } from "@/lib/log";
+import { RUN_OPTIONS } from "@/lib/config";
 
 export async function POST(req: Request) {
   const raw = await req.text();
@@ -56,7 +57,7 @@ export async function POST(req: Request) {
     if (st !== "cancelled" && st !== "completed" && st !== "failed") failed.push(`run_still_stopping:${id}`);
   }
   for (const id of transcriptIds) if (!(await deleteTranscript(id))) failed.push(`asr:${id}`);
-  if (jobIds.length) await start(purgeLater, [jobIds]);
+  if (jobIds.length) await start(purgeLater, [jobIds], RUN_OPTIONS);
 
   log("delete_done", { runs: runIds.length, transcripts: transcriptIds.length, jobs: jobIds.length, failed: failed.length });
   return Response.json({ ok: failed.length === 0, failed }, { status: failed.length ? 207 : 200 });

@@ -1,10 +1,12 @@
-import { hasFilter } from "@/lib/audio";
+import { ffmpegInfo, hasFilter } from "@/lib/audio";
 import { MODELS, PIPELINE_VERSION } from "@/lib/config";
 
 // Unauthenticated, no data: what this deployment would run with.
 export async function GET() {
+  const ffmpeg = await ffmpegInfo();
   return Response.json({
-    ok: true,
+    ok: ffmpeg.ok,
+    ffmpeg,
     pipeline_version: PIPELINE_VERSION,
     models: MODELS,
     rubberband: await hasFilter("rubberband"),
@@ -14,5 +16,5 @@ export async function GET() {
       assemblyai: !!process.env.ASSEMBLYAI_API_KEY,
       openrouter: !!process.env.OPENROUTER_API_KEY,
     },
-  });
+  }, { status: ffmpeg.ok ? 200 : 503 });   // no ffmpeg = every job would fail at render: say so here
 }

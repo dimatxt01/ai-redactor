@@ -1,23 +1,23 @@
-# truering/: the TrueRing side
+# truering/: REFERENCE COPY ONLY. Never applied from here.
 
-Everything the worker needs inside TrueRing, at its TrueRing paths. It is byte-identical to TrueRing branch `feat/sample-redaction`. TrueRing's own rules still apply: stage on a branch, apply migrations one at a time with the `apply-migration` skill, and give each deploy its own go.
+> **Do not apply, deploy or copy anything in this folder into TrueRing.**
+> The migration, both edge functions and the admin page are applied **only from TrueRing's own repo, `Mahamadou2004/truering`** (branch `feat/sample-redaction`), through TrueRing's normal PR, migration and deploy process.
+> This folder mirrors that branch so the worker's tests and `npm run simulate` can run here. It is refreshed one way, TrueRing → here, with `refresh.sh`.
 
-| Path | What |
+| Path | What (as it is on the TrueRing branch) |
 |---|---|
 | `supabase/migrations/20261013090000_sample_redaction_worker.sql` | Extends RL-1 with `ALTER TABLE`. Adds the worker, cap and takedown columns; `sample_job_insert` / `_retry` / `sample_library_ingest`; the month cap; two guard triggers. Rollback: `scripts/rollbacks/rollback_20261013090000_…`. |
 | `supabase/functions/sample-redaction-bridge/` | The worker's only door into TrueRing (HMAC). Every action is scoped to one job. |
 | `supabase/functions/training-library-admin/` | Staff actions: pick, submit, retry, sweep, link, review, publish, withdraw, edit, delete every copy. |
-| `supabase/functions/_shared/sampleSignature.ts`, `telnyxRecording.ts` | New shared helpers. |
+| `supabase/functions/_shared/sampleSignature.ts`, `telnyxRecording.ts` | Shared helpers. |
 | `supabase/tests/sample_redaction/` | The migration on a throwaway Postgres on top of RL-1. |
 | `src/pages/admin/RecordingLibrary.tsx`, `src/components/recording-library/`, `src/lib/recordingLibraryFlag.ts` | The curation page at `/am/recording-library` and `/admin/recording-library`. |
-| `existing-files.patch` | Edits to existing TrueRing files: `App.tsx` and both layouts (routes and nav), `config.toml` (2 `verify_jwt` entries), the integrity manifest (2 triggers), `ops-alert` (key `sample_cost_cap`), FLAGS §76, TR_PLAN. |
-| `FILES` | The new files `install.sh` copies. |
-| RL-1 copies: `supabase/migrations/20261012180000_training_library.sql`, `supabase/tests/training_library/`, `scripts/{rollbacks,verify}/…20261012180000…`, `docs/recording-library/SPEC.md` | Unchanged from TrueRing main. They are here so the tests and the simulation run in this repo. `install.sh` refuses a checkout whose RL-1 differs. |
+| `docs/recording-library/SPEC.md`, `TR_PLAN.md` | The contract. SPEC v0.2 has delivery revised 2026-10-13: results are pulled through the bridge, with no callback. |
+| `existing-files.patch` | For reading only: the branch's edits to existing TrueRing files. |
+| `FILES` | The branch's new files. |
+| RL-1 copies: `supabase/migrations/20261012180000_training_library.sql`, `supabase/tests/training_library/`, `scripts/{rollbacks,verify}/…20261012180000…` | Unchanged from TrueRing main (RL-1 is live). The tests and the simulation build on them. |
 
 ```bash
-git -C /path/to/truering switch -c feat/sample-redaction   # or an existing branch
-bash truering/install.sh /path/to/truering                  # copies FILES, applies the patch; never commits or deploys
-bash truering/check.sh   /path/to/truering                  # deno check, migration tests, wiring, frontend tsc/eslint/vite build
+bash truering/refresh.sh /path/to/truering   # refresh this copy from a TrueRing checkout of feat/sample-redaction
+bash truering/check.sh   /path/to/truering   # read-only checks INSIDE that checkout: deno check, migration tests, wiring, frontend build
 ```
-
-`install.sh` also refuses to run on `main`, on a dirty tree, or when migration version `20261013090000` has been taken in the meantime.

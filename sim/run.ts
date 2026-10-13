@@ -415,8 +415,22 @@ async function main() {
     const walk = (d: string) => { if (!existsSync(d)) return; for (const n of readdirSync(d)) { const f = path.join(d, n); if (statSync(f).isDirectory()) walk(f); else if (f.endsWith(".json")) wfText.push(workflowText(readFileSync(f, "utf8"))); } };
     walk(WF_DATA);
     const wfAll = wfText.join(" ");
+    // retention 0 (lib/config.ts RUN_OPTIONS): a finished run keeps ids, timestamps and status, but no payloads
+    const runsDir = path.join(WF_DATA, "runs");
+    const runs = existsSync(runsDir) ? readdirSync(runsDir).map((f) => JSON.parse(readFileSync(path.join(runsDir, f), "utf8"))) : [];
+    const payloadsOf = (runId: string) => {
+      let n = 0;
+      const count = (d: string) => { for (const x of readdirSync(d)) { const f = path.join(d, x); if (statSync(f).isDirectory()) count(f); else if (x.includes(runId)) n += (readFileSync(f, "utf8").match(/"__type":\s*"Uint8Array"/g) ?? []).length; } };
+      count(WF_DATA);
+      return n;
+    };
+    const finished = runs.filter((r) => ["completed", "failed", "cancelled"].includes(r.status));
+    const kept = finished.filter((r) => payloadsOf(r.runId) > 0);
+    check(`Workflow retention 0: every run asks for it, and the ${finished.length} finished runs keep no payloads`,
+      runs.length > 0 && runs.every((r) => r.attributes?.$retention === "0") && finished.length > 0 && kept.length === 0,
+      `${runs.length} runs; payloads left only on ${runs.length - finished.length} still-running (sleeping purgeLater) runs`);
     // positive control: the decoder must see what IS in there (job ids), or "nothing found" proves nothing
-    check(`Workflow event log decoded (${wfText.length} files; job ids visible)`, wfText.length > 0 && wfAll.includes(norm(job1)) && wfAll.includes(norm(job9)));
+    check(`Workflow event log decoded (${wfText.length} files; job ids visible in the still-running runs)`, wfText.length > 0 && wfAll.includes(norm(job1)) && wfAll.includes(norm(job9)));
     scan("Workflow event log holds no planted value (step inputs/outputs decoded)", wfAll);
     cpSync(WF_DATA, path.join(OUT, "workflow-data"), { recursive: true });
     const dump = execFileSync(path.join(PGBIN, "pg_dump"), ["-h", "127.0.0.1", "-p", String(PORT.pg), "-U", "postgres", "--data-only", "-T", "public.calls", "-T", "public.agents", "postgres"], { encoding: "utf8", maxBuffer: 1 << 28 });
@@ -468,6 +482,8 @@ async function verifyDone(job: string, m: Manifest, fakes: Fakes) {
   check("artifacts in training-library/<job_id>/ (TR's bucket)", want.every((f) => files.includes(f)), files.join(", "));
   check("scratch copies in sample-src/<job_id>/ deleted", filesUnder("sample-src", job).length === 0, filesUnder("sample-src", job).join(", ") || "empty");
   const asr = [...fakes.transcripts.values()].filter((t) => t.job === job);
+  // the job turns done one step before purgeAsr runs: give that step its moment
+  for (let i = 0; i < 60 && !asr.every((t) => fakes.deleted.has(t.id)); i++) await sleep(250);
   check("AssemblyAI copies deleted when the job finished", asr.length >= 2 && asr.every((t) => fakes.deleted.has(t.id)), `${asr.filter((t) => fakes.deleted.has(t.id)).length}/${asr.length} deleted`);
   check("cost recorded once per item, under the $2 job cap", j.cost_usd > 0 && j.cost_usd <= 2 && Object.keys(j.items ?? {}).length > 0, `$${j.cost_usd} (${Object.keys(j.items ?? {}).length} items)`);
 

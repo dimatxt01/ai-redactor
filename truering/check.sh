@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Checks for the TrueRing side of the Recording Library worker, run INSIDE a TrueRing checkout that has these
-# files (truering/install.sh puts them there). Touches nothing live: no Supabase project, no deploy.
+# Read-only checks for the TrueRing side of the Recording Library worker, run INSIDE a TrueRing checkout of
+# Mahamadou2004/truering branch feat/sample-redaction. Touches nothing live: no Supabase project, no deploy.
+# It never copies anything into the checkout (truering/ here is a reference copy only).
 #
 #   bash truering/check.sh /path/to/truering            # from the ai-redactor repo
 #
@@ -11,7 +12,7 @@ set -uo pipefail
 TR="${1:?usage: bash truering/check.sh /path/to/truering}"
 TR="$(cd "$TR" && pwd)"
 cd "$TR"
-[ -f supabase/functions/sample-redaction-bridge/index.ts ] || { echo "$TR has no sample-redaction-bridge: run truering/install.sh first"; exit 2; }
+[ -f supabase/functions/sample-redaction-bridge/index.ts ] || { echo "$TR has no sample-redaction-bridge: check out branch feat/sample-redaction of Mahamadou2004/truering"; exit 2; }
 
 DENO=(npx -y deno@2.9.6)
 FAILS=0

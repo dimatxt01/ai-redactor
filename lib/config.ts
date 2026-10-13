@@ -3,6 +3,11 @@
 // one is a pipeline change: bump PIPELINE_VERSION with it, so every result says
 // which pipeline produced it.
 
+// Every run is started with retention 0: the Workflow World deletes the run's inputs, outputs and event
+// payloads as soon as it ends (only ids, timestamps, status and step names stay, for the dashboard). Step I/O
+// carries only ids, hashes, counts and offsets anyway; this keeps even those for the shortest time possible.
+export const RUN_OPTIONS = { experimental_retention: 0 } as const;
+
 export const PIPELINE_VERSION = "sr-2.0.0";   // 2.0: SPEC v0.2 clip taxonomy, smart clips, fe_v1 coaching
 
 // Output schema (SPEC v0.2 §7): adding fields = minor, renaming/removing = major (30 days side by side).

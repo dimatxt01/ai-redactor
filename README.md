@@ -24,7 +24,9 @@ sample_redaction_jobs · training_library_* (RL-1) · storage sample-src/<job_id
 
 - **The worker holds no Supabase key.** The bridge is its only way into TrueRing, and each call is scoped to one job.
 - **Each direction has its own secret.** Requests are signed `X-TR-Signature: t=<unix>,v1=<hmac>` and accepted for ±300 s.
-- **The TrueRing side lives in [`truering/`](truering/), at its TrueRing paths:** the migration, the two edge functions, the curation page and the wiring edits. It is byte-identical to TrueRing branch `feat/sample-redaction`. [`truering/install.sh`](truering/install.sh) puts it into a TrueRing checkout; see [`truering/README.md`](truering/README.md).
+- **The service is input/output only.** It has no database, tables, buckets or Supabase key. Every recording, clip, transcript and coaching note is stored on TrueRing's side. Temp files and AssemblyAI's copies are deleted every run, and OpenRouter keeps nothing. Results come back by **pull through the bridge**, with no callback (SPEC v0.2, delivery revised 2026-10-13).
+- **The only state on Vercel is the Workflow run log:** ids, hashes and counts, never content. Every run starts with retention 0 (`lib/config.ts` `RUN_OPTIONS`), so its payloads are deleted as soon as it ends.
+- **[`truering/`](truering/) is a REFERENCE COPY ONLY** of the TrueRing side: the migration, the two edge functions, the curation page and the wiring edits. They are applied **only from `Mahamadou2004/truering`** (branch `feat/sample-redaction`), never from this repo. See [`truering/README.md`](truering/README.md).
 
 ## Test it
 
@@ -33,7 +35,7 @@ npm ci
 npm run simulate                  # the whole system on this machine, no keys, nothing live (~1 min)
 npm run validate -- --offline     # every check incl. the simulation; no vendor calls
 npm run validate                  # + the real-vendor eval if ASSEMBLYAI_API_KEY / OPENROUTER_API_KEY are set (~$1.60)
-bash truering/check.sh /path/to/truering   # TrueRing-side checks inside a TrueRing checkout (after install.sh)
+bash truering/check.sh /path/to/truering   # read-only TrueRing-side checks inside a checkout of Mahamadou2004/truering feat/sample-redaction
 ```
 
 Prerequisites: Node ≥22 and PostgreSQL 15+ (`brew install postgresql@17`). Deno comes via `npx`. Generating the test calls needs macOS `say`.
@@ -76,13 +78,13 @@ The output goes to `sim-out/<time>/`:
 
 ## Deploy (each step its own go)
 
-1. **TrueRing:**
-   - `bash truering/install.sh <truering checkout>` on a branch, then `bash truering/check.sh <checkout>`; review and merge.
+1. **TrueRing (in `Mahamadou2004/truering`, never from here):**
+   - Review and merge branch `feat/sample-redaction`. `bash truering/check.sh <checkout>` runs its checks.
    - Apply migration `20261013090000_sample_redaction_worker.sql` (TrueRing's `apply-migration` skill), then redeploy `integrity-audit`.
    - Set the secrets below, then deploy `training-library-admin`, `sample-redaction-bridge` and `ops-alert`.
 2. **This repo:**
-   - Create the Vercel project from the repo root (framework Next.js; `vercel.json` sets the function sizes).
-   - Set the env below, deploy, and check `GET /api/health`: `configured` should show all true, plus the pinned models.
+   - Vercel project `ai-redactor` (team `piskundzmitry-1528's projects`). Created 2026-10-13 with no env vars and no Git link.
+   - Set the env below, deploy, and check `GET /api/health`: `ok` and `ffmpeg.ok` must be true (it answers 503 without the binary), and `configured` must show all true.
 3. **TrueRing frontend:** deploy it. The page stays hidden while the flag is off.
 4. **Pilot:** arm `recording_library` (TrueRing FLAGS §76) and run 5 internal calls with offline consent. Listen to every file and clip. Confirm the Telnyx channel order.
 
@@ -113,5 +115,5 @@ Rollback, in order:
 | `fixtures/calls/` | 12 synthetic two-voice calls with planted, fictional PII (`npm run make-test-calls` renders them). |
 | `scripts/` | `validate.sh`, `eval-test-calls.ts` (real vendors), `signature-parity.ts` (TrueRing ↔ worker HMAC), `check-ffmpeg.mjs`. |
 | `sim/` | The end-to-end simulation (`npm run simulate`). |
-| `truering/` | The TrueRing side + `install.sh`, `check.sh`, `FILES`, `existing-files.patch`. |
+| `truering/` | Reference copy of the TrueRing side (never applied from here) + `refresh.sh`, `check.sh`, `FILES`, `existing-files.patch`. |
 | `docs/DESIGN.md` | The pipeline in detail, how each requirement is met, deliberate deviations from SPEC v0.2, the 2026-10-13 review item by item. |

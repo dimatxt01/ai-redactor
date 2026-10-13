@@ -15,23 +15,290 @@ index 5c42c476..5dd116db 100644
 +Arm (own go, after migration `20261013090000`, the two functions and the worker are live): `update feature_flags set enabled = true where key = 'recording_library';`
 +Silence: `update feature_flags set enabled = false where key = 'recording_library';` (submit refused from the next request; nav hidden within 60 s).
 +**Manifest:** RL-1 (2026-10-12.1) put the flag in `flags.known_optional`; 2026-10-12.3 adds the triggers `sample_redaction_jobs_service_columns` and `sample_redaction_takedown_guard`.
+diff --git a/docs/recording-library/SPEC.md b/docs/recording-library/SPEC.md
+index 9bacdd6c..8310cff9 100644
+--- a/docs/recording-library/SPEC.md
++++ b/docs/recording-library/SPEC.md
+@@ -1,7 +1,9 @@
+-# True Ring: Recording Redaction + Coaching Service, spec v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers)
++# True Ring: Recording Redaction + Coaching Service, spec v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers; delivery revised 2026-10-13: pull through the bridge, no callback)
+ 
+-This is an external service that Dmitry builds separately (n8n plus models via OpenRouter or a speech API). True Ring (TR) sends it calls privately; it returns PII-bleeped audio and transcripts; TR AMs/admins pick sales calls and, after a human QA listen, publish the results to an internal **training** Recording Library (smart clips of the key sale moments plus AI coaching notes).
+-Status: draft. Based on read-only prod/repo scoping on 2026-10-12. Nothing built.
++This is a separate service, the `ai-redactor` worker (its own repo and Vercel project; Vercel Workflow + ffmpeg, AssemblyAI for speech, OpenRouter for text). True Ring (TR) starts it per call; the worker pulls the call's inputs and pushes its results **through one TR edge function, `sample-redaction-bridge`**, straight into TR's storage and tables. TR AMs/admins pick sales calls and, after a human QA listen, publish the results to an internal **training** Recording Library (smart clips of the key sale moments plus AI coaching notes).
++Status: built (worker + TR side on branch `feat/sample-redaction`), not deployed. TR_PLAN.md RL-2/RL-3 describe the TR side.
++
++**The service is input/output only.** It has no database, tables, buckets or Supabase key. Every recording, clip, transcript and coaching note is stored on TR's side (RL-1 buckets and tables). Its temp files and AssemblyAI's copies are deleted every run; OpenRouter keeps nothing (zero data retention, no training). Its only state is the Workflow run log, which carries ids, hashes and counts, never content, and is deleted when the run ends (§4).
+ 
+ ## 1. Input contract (from real data)
+ 
+@@ -23,48 +25,47 @@ Audio:
+ - Sample rate and bitrate: **unknown/verify**. The latest URL had already expired when probed, so no headers could be read. Expect 8 kHz telephony audio.
+ 
+ Fetching:
+-- TR never sends a stored URL as-is.
+-- Before submitting, TR gets a fresh link from Telnyx, the same way `recording-proxy` / `_shared/recordingUrl.ts` do.
+-- Preferred: copy the file into a private TR bucket (`sample-src/`) and send a **Supabase signed URL, valid 15 min**.
+-- The service must download it right away and must not store the URL.
++- TR never sends a stored URL, and nothing is copied in advance.
++- When the worker reaches its fetch step it asks the bridge (`source`) for a **fresh Telnyx link**, the same lookup `recording-proxy` does, and downloads it at once. It never stores the URL. A new link is fetched on every attempt (they expire in ~10 min).
++- Twilio-era recordings are out of v1 (`unsupported_source`).
+ 
+-Sample submit payload:
++Start (TR `training-library-admin` → worker `POST /api/jobs`, HMAC). The body is ids only:
++```json
++{ "job_id": "6e1e1645-67cc-4cb1-9a0e-2c1f0d6f9e11", "idempotency_key": "call:2948f3a3-d352-4e3b-8976-1af6b7fb0230:v1" }
++```
++TR first writes the job row (`sample_job_insert`: the key, options, call meta, the reserved cost). The worker then pulls the job's inputs from the bridge (`job`):
+ ```json
+ {
+-  "job_id": "srj_01J…",
+-  "idempotency_key": "call:2948f3a3-d352-4e3b-8976-1af6b7fb0230:v1",
+-  "call": {
+-    "id": "2948f3a3-d352-4e3b-8976-1af6b7fb0230",
+-    "duration_s": 764,
+-    "disposition": "Sale",
+-    "agent_ref": "agent_7",
+-    "vertical": "final_expense",
+-    "recorded_at": "2026-10-12T22:44:01Z"
+-  },
+-  "audio": {
+-    "url": "https://<project>.supabase.co/storage/v1/object/sign/sample-src/…?token=…",
+-    "expires_at": "2026-10-12T23:10:00Z",
+-    "format": "mp3",
+-    "channels": 2,
+-    "channel_map": { "customer": 0, "agent": 1 }
+-  },
+-  "options": {
+-    "bleep_pad_ms": 250,
+-    "pitch_shift_customer": false,
+-    "clips": { "enabled": true, "max_per_call": 6, "min_s": 20, "max_s": 240 },
+-    "coaching": { "enabled": true, "rubric": "fe_v1" },
+-    "extra_terms": ["<agent first/last name>", "<carrier names>"]
++  "job": {
++    "id": "6e1e1645-…", "call_id": "2948f3a3-…", "version": 1, "status": "queued",
++    "options": {
++      "bleep_pad_ms": 250,
++      "pitch_shift_customer": false,
++      "redact_health": true,
++      "clips": { "enabled": true, "max_per_call": 6, "min_s": 20, "max_s": 240 },
++      "coaching": { "enabled": true, "rubric": "fe_v1" },
++      "extra_terms": ["<carrier names the AM added>"],
++      "customer_channel": 0
++    },
++    "call_meta": {
++      "duration_s": 764, "disposition": "Sale", "vertical": "final_expense", "caller_state": "TX",
++      "recorded_at": "2026-10-12T22:44:01Z",
++      "channel_map": { "customer": 0, "agent": 1, "verified": false }
++    }
+   },
+-  "callback_url": "https://<project>.supabase.co/functions/v1/sample-redaction-callback"
++  "extra_terms": ["<agent first/last name>", "<caller first/last name>", "<carrier names the AM added>"],
++  "idempotency_key": "call:2948f3a3-…:v1",
++  "caps": { "job_usd": 2, "month_usd": 100, "spent_usd": 0, "asr_usd_per_hour": 0.45 }
+ }
+ ```
+-- `agent_ref` is a pseudonym. The service never receives agent names except in `extra_terms`, which are the terms to bleep.
+-- `channel_map` stays "verify" until the pilot has confirmed it.
++- Top-level `extra_terms` = the agent's and caller's names, read from TR rows at request time and never stored on the job, plus the AM's own terms from `options`.
++- `channel_map` stays `verified:false` until the pilot has confirmed it; every result is QA-flagged `channel_map_unverified` until then.
++- Missing or malformed options fall back to the defaults above; redaction settings fail safe.
+ 
+ ## 2. Processing
+ 
+ 1. Download the audio, check the duration against `duration_s` (±5%), and split it into its two channels.
+-2. **Transcribe** each channel with **word-level timestamps** and diarization by channel. Options: AssemblyAI (with built-in PII audio redaction), Deepgram Nova (`redact=pii,numbers`), or AWS Transcribe Call Analytics. An LLM via OpenRouter can be used **only** for classifying entities on top of a timestamped transcript, never for producing the timestamps.
++2. **Transcribe** each channel with **word-level timestamps** and diarization by channel: AssemblyAI, one pinned model, `multichannel`, entity detection. An LLM via OpenRouter is used **only** for classifying entities on top of the timestamped transcript, never for producing the timestamps.
+ 3. **PII entities:**
+    - person names (the customer's and the agent's, plus `extra_terms`);
+    - phone numbers;
+@@ -110,56 +111,64 @@ Sample submit payload:
+ - **Coaching:** `coaching.json` = `{summary, strengths[], improvements[], scores{rapport,discovery,objections,close,compliance}, turning_point_clip_id, rubric:"fe_v1", model}`.
+ - **Transcript:** JSON of `[{channel, speaker:"customer"|"agent", start_ms, end_ms, text}]`. Redacted words appear as `[REDACTED:<TYPE>]`. A `.txt` render is also provided.
+ - **PII spans:** `[{type, start_ms, end_ms, channel, confidence, detector:"model"|"regex"|"digit_run"|"extra_term", padded_start_ms, padded_end_ms}]`. They contain **no original text**.
+-- **Status:** `queued` → `fetching` → `transcribing` → `redacting` → `verifying` → `done` | `failed` (with `error_code`: `fetch_expired` | `bad_audio` | `asr_failed` | `timeout`).
++- **Status:** `queued` → `fetching` → `transcribing` → `redacting` → `verifying` → `done` | `failed` (with `error_code`: `fetch_expired` | `bad_audio` | `asr_failed` | `timeout` | `unsupported_source` | `cost_cap` | `internal`), and `deleted` after a takedown. The worker moves the status forward through the bridge (`status`); it lives on TR's job row.
+ 
+-Callback (POST to `callback_url`):
++**Delivery (pull through the bridge; there is no callback).**
++1. The worker asks the bridge (`sign`) for signed upload URLs under `training-library/<job_id>/` and PUTs each file there: `redacted.mp3`, `clips/cN.mp3`, `transcript.json`, `transcript.txt`, `pii_spans.json`, `clips.json`, `coaching.json`. Nothing is uploaded anywhere else, and the worker keeps no copy.
++2. It then calls the bridge's `complete`. The bridge checks every named file is in the job's prefix, and `sample_library_ingest` writes, in one transaction, the job as `done` plus `training_library_calls` (`pending_qa`), `_call_sources` and `_clips`. A repeat by the same run returns the same library row.
+ ```json
+ {
+-  "job_id": "srj_01J…",
+-  "idempotency_key": "call:2948f3a3-…:v1",
+-  "call_id": "2948f3a3-…",
+-  "status": "done",
++  "action": "complete", "job_id": "6e1e1645-…", "run_id": "wrun_01J…",
++  "pipeline_version": "sr-2.0.0", "schema_version": "1.0",
+   "qa_flag": true,
+-  "qa_reasons": ["second_pass_digit_run@612340ms"],
++  "qa_reasons": ["channel_map_unverified", "second_pass_digit_run@612340ms"],
+   "metrics": { "asr_confidence": 0.91, "clips": 6, "pii_spans": 37, "bleeped_ms": 18450, "duration_ms": 764000 },
+   "artifacts": {
+-    "redacted_audio": { "url": "<signed, 24h>", "sha256": "…", "bytes": 12345678 },
+-    "clips": [
+-      { "clip_id": "c1", "label": "opener", "start_ms": 2100, "end_ms": 48300, "audio_exported": true,
+-        "url": "<signed, 24h>", "sha256": "…", "title": "Warm opener, sets agenda",
+-        "coaching": { "did": "…", "worked": "…", "improve": "…", "scores": { "rapport": 4 } } },
+-      { "clip_id": "c4", "label": "objection", "sub_label": "price", "start_ms": 612000, "end_ms": 741500, "audio_exported": true, "url": "<signed, 24h>", "sha256": "…", "coaching": { "…": "…" } },
+-      { "clip_id": "c6", "label": "application", "start_ms": 1490000, "end_ms": 1820000, "audio_exported": false, "coaching": { "…": "…" } }
+-    ],
+-    "coaching_json": { "url": "<signed, 24h>", "sha256": "…" },
+-    "transcript_json": { "url": "<signed, 24h>", "sha256": "…" },
+-    "pii_spans_json": { "url": "<signed, 24h>", "sha256": "…" }
++    "redacted_audio": { "name": "redacted.mp3", "sha256": "…", "bytes": 12345678 },
++    "transcript_json": { "name": "transcript.json", "sha256": "…" },
++    "transcript_txt": { "name": "transcript.txt", "sha256": "…" },
++    "pii_spans_json": { "name": "pii_spans.json", "sha256": "…" },
++    "clips_json": { "name": "clips.json", "sha256": "…" },
++    "coaching_json": { "name": "coaching.json", "sha256": "…" }
+   },
+-  "engine": { "asr": "assemblyai:universal", "pii": "assemblyai+regex v1", "llm": "openrouter:<model>" },
+-  "completed_at": "2026-10-12T23:20:11Z"
++  "clips": [
++    { "clip_id": "c1", "label": "opener", "sub_label": null, "start_ms": 2100, "end_ms": 48300, "audio_exported": true,
++      "audio": { "name": "clips/c1.mp3", "sha256": "…" }, "title": "Warm opener, sets agenda",
++      "coaching": { "did": "…", "worked": "…", "improve": "…", "key_lines": ["…"], "scores": { "rapport": 4 } }, "confidence": 0.82 },
++    { "clip_id": "c6", "label": "application", "sub_label": null, "start_ms": 1490000, "end_ms": 1820000, "audio_exported": false, "audio": null, "coaching": { "…": "…" } }
++  ],
++  "coaching": { "summary": "…", "strengths": ["…"], "improvements": ["…"], "scores": { "…": 4 }, "turning_point_clip_id": "c4", "rubric": "fe_v1", "model": "…" },
++  "engine": { "asr": "assemblyai:<model>", "pii": "assemblyai-entities+rules+openrouter sr-2.0.0", "llm": "openrouter:<model>", "pipeline": "sr-2.0.0" }
+ }
+ ```
++3. On a failure the worker calls `fail` with the code; the bridge ends the job and deletes both the scratch copy and any partial artifacts.
+ 
+ ## 4. Integration
+ 
+ **Auth:**
+ - Both directions use an HMAC-SHA256 header: `X-TR-Signature: t=<unix>,v1=<hex(hmac(secret, t + "." + raw_body))>`.
+ - Reject requests outside ±5 min.
+-- Each direction has its own secret. Secrets live only in Supabase function secrets and n8n credentials. The service's URL is not public; use an IP allowlist or a shared header too.
++- Each direction has its own secret: `SAMPLE_REDACTOR_START_SECRET` (TR → worker) and `SAMPLE_REDACTOR_BRIDGE_SECRET` (worker → bridge). They live only in Supabase function secrets and the worker's Vercel env. A missing secret rejects.
++
++**Endpoints:**
++- Worker (called by TR): `POST /api/jobs` (start a run), `POST /api/delete` (cancel runs, delete AssemblyAI's copies), `GET /api/health` (no data).
++- Bridge (called by the worker; the worker's only way into TR): `job` (inputs), `claim`, `source` (fresh Telnyx link), `sign` (signed URLs, only under `sample-src/<job_id>/` and `training-library/<job_id>/`), `status`, `cost`, `asr` (records a vendor transcript id for deletion), `complete`, `fail`, `purge`. Every action names one job; after `claim`, every action must come from the run that claimed it.
+ 
+ **Lifecycle:**
+-- `POST /jobs` (submit). The same `idempotency_key` returns the existing job; `:v2` forces a reprocess.
+-- `GET /jobs/:id` (status).
+-- The callback fires on `done` or `failed`. It is retried 5× with exponential backoff (1 m → 2 h). TR deduplicates on `job_id` + `status`.
+-- `fetch_expired` → TR re-signs the link and resubmits with the same key.
+-- A job running over 2 h is marked `failed:timeout`.
++- Submit: TR writes the job (key `call:<id>:v<n>`; the same key returns the existing job, `:v2` reprocesses) and calls `POST /api/jobs`.
++- Exactly once: the first run to `claim` a queued job owns it (compare-and-swap); a duplicate start, or a start whose key does not match the job, exits without touching it.
++- Status: there is no `GET /jobs/:id`; TR reads its own job row.
++- `fetch_expired` → TR's `retry` restarts the job with the same key (the next attempt fetches a fresh link).
++- A job running over 2 h is marked `failed:timeout` (bridge, and TR's sweep).
+ 
+-**Storage:**
+-- Private Supabase bucket `sample-library`. The service's signed links are only for TR to copy from.
+-- TR copies the artifacts into `sample-library/<call_id>/v<n>/…` and serves them only as short-lived signed URLs (admin role check, the same pattern as `recording-proxy`).
+-- The service deletes its copies 7 days after the callback.
++**Storage (TR side only; RL-1 buckets, private):**
++- `sample-src/<job_id>/`: the worker's scratch between steps (source copy, names, spans, clip windows). Deleted when the job ends, done or failed.
++- `training-library/<job_id>/`: the artifacts. Served only as short-lived signed links (staff via `training-library-admin` `link`, access logged).
++- Paths carry the job id, never `calls.id`.
+ 
+-**Proposed TR tables (not created):**
++**Deletion (takedown):** TR's `delete` tombstones the call first (every bridge action then refuses it), calls the worker's `POST /api/delete` (cancel runs, wait for them to stop, delete AssemblyAI's transcripts), purges both buckets, and withdraws and empties the library rows. The job is `deleted` only after the worker answers 200; a 207 means try again.
++
++**TR tables (built: RL-1 `20261012180000_training_library` + worker columns `20261013090000_sample_redaction_worker`):**
+ - `sample_redaction_jobs`: id, call_id, idempotency_key unique, status, qa_flag, qa_reasons jsonb, metrics jsonb, engine jsonb, submitted_by, timestamps.
+ - `training_library_calls`: id, call_id, job_id, version, agent_ref (pseudonym), source_agent_id (admin-only column), vertical, duration_s, full-audio path and sha256, `coaching` jsonb, title, tags, `status` (`pending_qa` | `published` | `rejected` | `withdrawn`).
+ - `training_library_clips`: id, library_call_id, label, sub_label, start_ms, end_ms, audio path (nullable when not exported), sha256, title, `coaching` jsonb, sort order.
+@@ -184,30 +193,16 @@ Callback (POST to `callback_url`):
+   - **Health details:** bleep conditions and medications in the audio. The `application` clip has no audio by default.
+   - **Access:** RLS-gated, short signed links, no downloads in the UI, access logged.
+ - **Retention:**
+-  - Service: copies deleted ≤7 days after the callback.
++  - Service: none. Temp files are deleted at the end of every step; AssemblyAI transcripts are deleted when the job ends (and again on takedown). The Workflow run log holds ids, hashes and counts only, and each run is started with retention 0, so its inputs, outputs and event payloads are deleted as soon as it ends.
+   - TR `sample-src` copies: deleted after the job finishes.
+   - Library: reviewed every 12 months; withdrawn on agent revoke or a consumer request.
+ - **Vendors:** zero data retention, no training on the data. LLM calls get transcript text only, never audio.
+ 
+-## 6. n8n feasibility
+-
+-**Fits:** orchestration.
+-- Webhook node: submit, plus an HMAC check in a Code node.
+-- HTTP Request node: download the binary, then call AssemblyAI/Deepgram.
+-- Wait node or polling loop: wait for the async speech-to-text result, or use the vendor's own webhook.
+-- Code node: regex, digit runs and span merging.
+-- OpenRouter: an HTTP or AI node for the entity check, clip segmentation and coaching.
+-- HTTP Request: the signed callback.
+-- Postgres or Data Table: job state.
++## 6. Implementation (in-house, no n8n)
+ 
+-**Limits:**
+-- n8n has **no audio DSP**. Bleeping, padding, channel split, pitch-shift and clipping need ffmpeg: Execute Command (self-hosted only) or a small ffmpeg worker container called by HTTP.
+-- **Long audio:** 30–40 min mp3s are ~30–60 MB. With default in-memory binary mode memory blows up, so set `N8N_DEFAULT_BINARY_DATA_MODE=filesystem` or use S3 mode.
+-- **Timeouts:** speech-to-text for a 40-min call takes minutes. Use async with a vendor webhook or Wait-node polling, never a blocking HTTP call. Raise `EXECUTIONS_TIMEOUT`.
+-- **n8n Cloud:** limits on executions and binary size, and no Execute Command, so **self-hosted is recommended**.
+-- **Retries and idempotency:** store them in the DB yourself; n8n's retry-on-fail alone is not enough.
+-- **Clips and coaching:** one LLM call per call (segmentation + coaching JSON with a schema check in a Code node), then an ffmpeg cut per clip. This adds about 1–2 min per call.
+-- **Recommended shape:** n8n for orchestration, AssemblyAI (audio redaction built in) or Deepgram plus an ffmpeg worker, regex and LLM in Code/HTTP nodes.
++- `ai-redactor`, a separate repo and Vercel project: Next.js routes for the three endpoints, one durable Vercel Workflow run per job (claim → fetch → transcribe → detect → render → clips + coaching → verify → complete), ffmpeg (`ffmpeg-static`, shipped with every function) for bleeping, mixing and clips.
++- Long calls: the run sleeps while AssemblyAI works (vendor webhook to wake it, polling as a fallback); no function holds a long request open.
++- The run passes only ids, hashes, counts and offsets between steps; text lives in TR's `sample-src/<job_id>/` scratch in between.
+ 
+ ## Open items to verify
+ - Customer and agent channel order in the dual-channel mp3.
+@@ -220,13 +215,13 @@ Callback (POST to `callback_url`):
+ - **Dual channel:**
+   - TR records `mp3`, `channels:'dual'` (Telnyx `record_start`). Each leg is on its own channel.
+   - Which channel is the customer is **not yet verified**. Telnyx maps channels by call leg; check their `record_start` docs.
+-  - Run `ffprobe -show_streams` on a few freshly signed pilot files, listen to the first 10 s of each channel, and record the result as `channel_map` in the submit payload. Don't infer it at runtime.
++  - Run `ffprobe -show_streams` on a few freshly signed pilot files, listen to the first 10 s of each channel, and record the result as `channel_map` on the job (the AM's choice on submit). Don't infer it at runtime.
+   - Transcribe each channel separately; this gives speaker labels for free.
+ - **Idempotency:**
+-  - `POST /jobs` with an existing `idempotency_key` returns the existing job (same `job_id`); the job never runs twice.
+-  - Callbacks are at-least-once. Every callback carries `job_id`, `status` and `attempt`. TR dedupes on `(job_id, status)` and returns 2xx for duplicates.
++  - Submitting an existing `idempotency_key` returns the existing job (same `job_id`); the job never runs twice.
++  - A duplicate `POST /api/jobs` starts a run that loses the `claim` and exits. `complete`, `fail` and the cost ledger (per item) are idempotent, so a replayed step does nothing twice.
+ - **Length and timeouts:**
+-  - Plan for **60 min max** (49-min calls exist), about 60 MB mp3. Reject anything over 90 min with `bad_audio:too_long`.
++  - Plan for **60 min max** (49-min calls exist), about 60 MB mp3. Reject anything over 60 min (±5%) with `bad_audio:too_long`.
+   - Everything is async: speech-to-text through the vendor's async API with a webhook or polling, never a synchronous HTTP call.
+   - Per-job wall clock is 2 h. Stream the download to disk, not memory.
+ - **Models:**
+@@ -250,13 +245,11 @@ Callback (POST to `callback_url`):
+   - CI target: 100% of planted PII bleeped (with padding), 0 PII in the second pass, clip labels stable across 3 reruns.
+   - Never use real customer calls as fixtures.
+ - **Retries:**
+-  - Fetch: 3× with backoff 30 s / 2 m / 10 m. If the signed URL expired, return `fetch_expired` so TR re-signs; don't retry.
+-  - STT and LLM: 3× with exponential backoff and jitter.
+-  - Callback: 5× over about 2 h.
++  - Fetch: a fresh link per attempt. If Telnyx no longer has the recording (or the download is refused), fail with `fetch_expired`; TR's retry restarts the job.
++  - STT, LLM and bridge calls: retried with backoff by the workflow step (transient errors only).
+ - **Logging:** log job_id, call_id, status, timings, counts and cost only. **Never** transcripts, PII text, signed URLs or secrets. Redact URLs to the host.
+ - **Secrets:**
+   - Separate HMAC secrets for each direction. Rotate every 90 days or on suspected exposure, with a 24 h overlap where both old and new are accepted (`v1=` signature header supports several keys).
+-  - Vendor keys stay in n8n credentials only.
++  - Vendor keys stay in the worker's Vercel env only.
+ - **Deletion:**
+-  - `DELETE /jobs/:id` (HMAC) removes every service-side copy (source, artifacts, transcripts, logs that reference the job) and confirms by callback `status:"deleted"`.
+-  - The automatic ≤7-day cleanup still applies.
++  - `POST /api/delete` (HMAC) cancels the job's runs, waits for them to stop, deletes AssemblyAI's transcripts and schedules one more purge of TR scratch after every signed upload URL has expired. It answers 200 when everything is gone, 207 when something must be retried. The service holds no other copy.
 diff --git a/docs/recording-library/TR_PLAN.md b/docs/recording-library/TR_PLAN.md
-index d6ce2880..dbf3e173 100644
+index d6ce2880..708f0931 100644
 --- a/docs/recording-library/TR_PLAN.md
 +++ b/docs/recording-library/TR_PLAN.md
-@@ -3,6 +3,12 @@
- **Ask:** a "Recording Library" tab for **internal training**. It holds smart clips of the key Final Expense sale moments (opener, discovery, objection handling, close, …), each with an AI coaching note, plus a coaching summary per call. AMs and admins pick calls manually; which agents is TBD.
- Assumes the service in `SPEC.md` v0.2 is done. Planning only; nothing built.
+@@ -1,7 +1,13 @@
+ # True Ring side: Training Recording Library, PR plan v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers)
  
+ **Ask:** a "Recording Library" tab for **internal training**. It holds smart clips of the key Final Expense sale moments (opener, discovery, objection handling, close, …), each with an AI coaching note, plus a coaching summary per call. AMs and admins pick calls manually; which agents is TBD.
+-Assumes the service in `SPEC.md` v0.2 is done. Planning only; nothing built.
++Contract: `SPEC.md` v0.2 (delivery revised 2026-10-13: pull through the bridge). Status: RL-1 applied; RL-2, RL-3, the staff part of RL-4 and RL-5 built on `feat/sample-redaction`, not deployed.
++
 +**Revised 2026-10-13 (Dmitry): the service is built in-house, without n8n** — the worker is its own repo, `ai-redactor` (Vercel Workflow + ffmpeg), deployed separately; this branch (`feat/sample-redaction`) holds only the TR side: migration, `training-library-admin`, `sample-redaction-bridge`, the curation page.
 +It keeps no copies, so the **signed callback (RL-3) is replaced by a bridge**. The worker reads its inputs and writes its results
 +through ONE HMAC edge function, `sample-redaction-bridge`, straight into the RL-1 buckets. TR copies nothing, the service retains
-+nothing, and the 7-day service-side retention and `DELETE /jobs/:id` callback are moot. `training-library-admin`'s delete removes
++nothing, and SPEC no longer has a callback, a 7-day service-side retention or `DELETE /jobs/:id` (removed 2026-10-13). `training-library-admin`'s delete removes
 +every copy, including AssemblyAI's. Every result and job row carries `schema_version` "1.0" (SPEC §7). Rows 2–5 below are updated to match.
-+
+ 
  ## Where the tab goes (read-only check)
  - **Agent portal `/agent`:** single-page, state-driven tabs: welcome, dashboard, take-calls, calls, script, billing, referrals, activity, support, settings. There is already an **`ai-training` tab** in the state union, rendering `AITrainingInProgress` (a placeholder), and **there is no nav button for it**.
- - **AM View `/am`:** routed pages under `AMLayout`: dashboard, agents, agencies, calls, reporting, revenue, earnings, leads, leads/pool, credit-history, notifications.
 @@ -31,13 +37,13 @@ Assumes the service in `SPEC.md` v0.2 is done. Planning only; nothing built.
  | # | PR | Contents | Flag | Effort | Depends on | Gos beyond the standard |
  |---|---|---|---|---|---|---|

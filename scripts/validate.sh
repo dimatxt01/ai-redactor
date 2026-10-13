@@ -184,7 +184,7 @@ wiring() {
     echo "migration writes feature_flags"; return 1; fi
   echo "rollback present; migration flips no flags"
 }
-step "repo: truering/ install set complete" "FILES present, patch non-empty, rollback in place" wiring
+step "repo: truering/ reference copy complete" "FILES present, patch non-empty, rollback in place" wiring
 
 hygiene() {
   local files bad=0
@@ -223,7 +223,7 @@ fi
   echo "- vendors: $( [ $OFFLINE = 1 ] && echo 'off (--offline)' || { [ -n "${ASSEMBLYAI_API_KEY:-}" ] && echo "AssemblyAI on, OpenRouter $( [ -n "${OPENROUTER_API_KEY:-}" ] && echo on || echo off)" || echo 'no keys'; })"
   echo "- live systems touched: none"
   [ -n "${SIM_REPORT:-}" ] && [ -f "$SIM_REPORT" ] && echo "- simulation report: \`${SIM_REPORT#$W/}\` ($(grep -o '[0-9]* passed, [0-9]* failed' "$SIM_REPORT" | head -1))"
-  echo "- TrueRing frontend + full deno check: run \`bash truering/check.sh /path/to/truering\` after \`truering/install.sh\`"
+  echo "- TrueRing frontend + full deno check: \`bash truering/check.sh /path/to/truering\` in a checkout of Mahamadou2004/truering feat/sample-redaction"
   echo
   echo "| result | check | time | detail |"
   echo "|---|---|---|---|"

@@ -52,7 +52,7 @@ Every JSON result is an envelope `{schema, schema_version: "1.0", pipeline_versi
 | Requirement | Where |
 |---|---|
 | Separate channels; TR says which is the customer | **Submit dialog:** the channel choice is stored in `call_meta.channel_map`. Every result is QA-flagged `channel_map_unverified` until the pilot confirms the order. |
-| Same call or a duplicate callback does nothing twice | **Key:** `call:<id>:v<n>` (DB check: key = call_id + version), and submit returns the existing job. **Bridge:** `claim` is a compare-and-swap and checks the key; `run_id` is required on every action. **Idempotent:** `complete` (ingest replay) and `fail`, and the cost ledger per item. |
+| Same call or a duplicate start does nothing twice | **Key:** `call:<id>:v<n>` (DB check: key = call_id + version), and submit returns the existing job. **Bridge:** `claim` is a compare-and-swap and checks the key; `run_id` is required on every action. **Idempotent:** `complete` (ingest replay) and `fail`, and the cost ledger per item. |
 | ≤60 min calls, 2 h per job | Submit and fetch reject calls over 60 min (`too_long`). The bridge fails any job older than 2 h; the admin `sweep` does the same. |
 | Dedicated transcriber; OpenRouter for text only; pinned | `lib/config.ts` `MODELS` (one id each, no fallbacks). OpenRouter runs with `provider.zdr=true, data_collection=deny`, temperature 0 and seed 7. The `engine` field records the models on every job. |
 | $2/job, $100/month, alert | **Reserve:** submit and retry reserve the estimate atomically (advisory lock). Running jobs count `max(cost, reserved)`. **Re-checks:** the bridge `claim` and every `cost` re-check the month. **Worker:** `guard` runs before each paid call and `charge` after. **Browser:** browser roles can't touch those columns (trigger). **Alert:** a month-cap block logs `sample_cost_cap_blocked`, which raises ops-alert key `sample_cost_cap`. |
@@ -65,7 +65,7 @@ Every JSON result is an envelope `{schema, schema_version: "1.0", pipeline_versi
 
 ## Deliberate deviations from SPEC v0.2
 
-- **The bridge replaces the signed callback** (decided 2026-10-13, TR_PLAN updated). There are no service-side copies, no 7-day retention and no `GET /jobs/:id`; status lives on the job row in TR.
+- ~~The bridge replaces the signed callback~~: no longer a deviation. SPEC v0.2's delivery was revised on 2026-10-13 to the pull-through-bridge flow as built (review of 4f7ad9a). There are no service-side copies, no 7-day retention, no `GET /jobs/:id` and no callback; status lives on the job row in TR.
 - **Second pass on clips is mapped, not re-transcribed.** Each clip is a cut of the redacted full audio that pass 2 transcribed, so a hit inside a clip window is the clip's hit. A third ASR pass per clip would add cost and find nothing new.
 - **Digit runs skip counts and amounts** ("two kids", "$45.50 a month", "ten thousand dollars", "the 10,000 plan"). This applies only when the run is ≤4 digits or said as an amount. A long number is bleeped whatever word follows it.
 - **Twilio-era recordings are out of v1.** The bridge returns `unsupported_source`.
@@ -95,5 +95,18 @@ Also fixed: calls RLS limits an AM to their own book, so the pick list is server
 
 ## After the review: repo split (2026-10-13)
 
-The worker is its own repo (this one) and its own Vercel project. TrueRing's branch `feat/sample-redaction` keeps only the TrueRing side; `truering/` here is that side, byte-identical, with `install.sh` to put it into a checkout and `check.sh` to verify it there.
+The worker is its own repo (this one) and its own Vercel project. TrueRing's branch `feat/sample-redaction` keeps only the TrueRing side; `truering/` here is a reference copy of that side (refreshed TrueRing → here with `refresh.sh`; never applied from here), and `check.sh` verifies a TrueRing checkout.
 The end-to-end simulation (`npm run simulate`) found one worker defect, now fixed: a job row whose `options` lacked `bleep_pad_ms` produced NaN bleep intervals, i.e. nothing bleeped (the second pass did flag it). `lib/options.ts` now fails every redaction setting safe, with tests in `test/options.test.ts`.
+
+## Review of 4f7ad9a (2026-10-13), item by item
+
+Decision: results come back by pull through `sample-redaction-bridge`, as built. No callback.
+
+| # | Asked | Done |
+|---|---|---|
+| 1 | SPEC.md: drop the signed callback, describe pull-through-bridge | SPEC is TrueRing's document, so it changed on TrueRing branch `feat/sample-redaction` and this repo's copy was refreshed. **Changed:** the start body (ids only); the bridge `job` / `sign` / `status` / `complete` / `fail` actions, with the actual `complete` payload; storage on TR's side only; takedown via `/api/delete`. **Removed:** the callback, `GET /jobs/:id`, the 7-day service copies and the n8n section. TR_PLAN's status line was updated to match. |
+| 2 | `truering/` is a reference copy only | `truering/README.md` and the root README say so first. `install.sh` (which applied it from here) is removed. `refresh.sh` copies one way, TrueRing → here, and `check.sh` only reads a TrueRing checkout. Applying happens only from `Mahamadou2004/truering`. |
+| 3 | Minimum Workflow log retention; ids, hashes and counts only | Every `start()` (the job run, and both `purgeLater` starts) passes `RUN_OPTIONS = { experimental_retention: 0 }`. The World deletes a run's inputs, outputs and event payloads as soon as it ends, keeping only ids, timestamps, status and step names. The simulation checks every run carries `$retention: "0"` and that finished runs keep no payloads. Still-sleeping `purgeLater` runs keep theirs (job ids) until they end. Step I/O stays ids, hashes, counts and offsets, checked by the simulation's decoded event-log scan. |
+| 4 | ffmpeg ships in the Vercel build | **Verified on Vercel:** the build log shows `ffmpeg-static ok: /vercel/path0/node_modules/ffmpeg-static/ffmpeg`. On the preview, `GET /api/health` (served by the same function bundle as `/api/jobs` and `/api/delete`) reported `ffmpeg: { ok, version 7.0.2-static, linux-x64, 79.8 MB }` and `rubberband: true`. **Per function:** a `vercel build` shows every function traces `node_modules/ffmpeg-static/ffmpeg`, including the workflow's `flow.func`. **Health:** now answers 503 when the binary is missing. **package.json:** gets `allowScripts` for `ffmpeg-static@5.3.0`, because Vercel's npm 11 warned that its install script wasn't approved (it still ran), and `engines.node` is pinned to `22.x`, because `>=22` had built on Node 24. |
+| 5 | Stale "sample-work bucket" comment | `workflows/steps.ts` now says TR's `sample-src/<job_id>/` scratch prefix. |
+| Rule | Input/output only | Unchanged and still met: no database, tables, buckets or Supabase key in the worker. |
