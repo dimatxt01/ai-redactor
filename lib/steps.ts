@@ -2,18 +2,18 @@
 // ffmpeg) and passes ONLY non-PII values onward: ids, counts, hashes, millisecond
 // offsets, detector/type names. Transcripts and names live in TR's private
 // sample-src/<job_id>/ scratch prefix between steps and in local /tmp inside one step (removed in
-// `finally`), so the workflow event log never holds personal data.
+// `finally`), so nothing the worker keeps in memory or logs between steps is personal data.
+// lib/job.ts runs them in order; a step that throws anything but FatalError is retried (lib/retry.ts).
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { FatalError, getStepMetadata } from "workflow";
 import { deleteTranscript, getTranscript, submitTranscript, type AaiEntity } from "@/lib/assemblyai";
 import { bridge, getWork, getWorkJson, putWork, signUrls, uploadSigned, downloadSigned, type JobInputs, type JobOptions } from "@/lib/bridge";
 import { cutClip, encodeMp3, probe, renderRedacted, writePcm, type PitchEngine } from "@/lib/audio";
 import { envelope, redactedLines, sha256, spansJson, transcriptJson, transcriptTxt, versionTag } from "@/lib/artifacts";
 import { CLIPS, LIMITS, MODELS, PIPELINE_VERSION, SCHEMA_VERSION } from "@/lib/config";
 import { asrCostUsd, charge, guard, LLM_RESERVE } from "@/lib/cost";
-import { jobError } from "@/lib/errors";
+import { FatalError, jobError } from "@/lib/errors";
 import { clipAndCoach, type CallCoaching, type Clip, type RedactedLine } from "@/lib/labels";
 import { log } from "@/lib/log";
 import { normalizeOptions } from "@/lib/options";
@@ -56,7 +56,6 @@ async function inputs(ctx: Ctx): Promise<JobInputs> {
 
 // ── 1. claim ────────────────────────────────────────────────────────────────
 export async function claimJob(jobId: string, runId: string, idempotencyKey: string): Promise<{ duplicate: true } | { duplicate: false; ctx: Ctx }> {
-  "use step";
   const inp = await bridge<JobInputs>("job", { job_id: jobId });
   try {
     // the bridge refuses a start whose key is not this job's key
@@ -88,13 +87,11 @@ export async function claimJob(jobId: string, runId: string, idempotencyKey: str
 }
 
 export async function setStatus(ctx: Ctx, status: "transcribing" | "redacting" | "verifying", engine?: Record<string, string>) {
-  "use step";
   await bridge("status", { job_id: ctx.jobId, run_id: ctx.runId, status, ...(engine ? { engine } : {}) });
 }
 
 // ── 2. fetch ────────────────────────────────────────────────────────────────
 export async function fetchSource(ctx: Ctx): Promise<Source> {
-  "use step";
   const dir = await scratch(ctx.jobId);
   try {
     // A fresh Telnyx link every attempt (they expire in ~10 min); downloaded at once, never stored.
@@ -123,8 +120,7 @@ export async function fetchSource(ctx: Ctx): Promise<Source> {
 }
 
 // ── 3. ASR (both passes) ────────────────────────────────────────────────────
-export async function submitAsr(ctx: Ctx, pass: "pass1" | "pass2", webhookUrl: string, durationMs: number): Promise<{ id: string }> {
-  "use step";
+export async function submitAsr(ctx: Ctx, pass: "pass1" | "pass2", durationMs: number): Promise<{ id: string }> {
   const inp = await inputs(ctx);
   const channels = pass === "pass1" ? 2 : 1;
   const est = asrCostUsd(durationMs, channels, ctx.asrUsdPerHour);
@@ -139,7 +135,6 @@ export async function submitAsr(ctx: Ctx, pass: "pass1" | "pass2", webhookUrl: s
   const { id } = await submitTranscript({
     audioUrl,
     multichannel: pass === "pass1",
-    webhookUrl,
     // pass 1: names TR knows, so the model spells them the way the name pass looks for them
     keyterms: pass === "pass1" ? inp.extra_terms.filter((t) => t.split(/\s+/).length <= 6) : [],
   });
@@ -156,13 +151,11 @@ export async function submitAsr(ctx: Ctx, pass: "pass1" | "pass2", webhookUrl: s
 }
 
 export async function asrStatus(id: string): Promise<"queued" | "processing" | "completed" | "error"> {
-  "use step";
   const t = await getTranscript(id);
   return t.status;
 }
 
 export async function savePass1(ctx: Ctx, id: string): Promise<{ words: number; avgConf: number; crosstalk: number }> {
-  "use step";
   const raw = await getTranscript(id);
   if (raw.status !== "completed") throw jobError("asr_failed", `pass1 status ${raw.status}`);
   const transcript = fromAssemblyAi(raw);
@@ -175,9 +168,8 @@ export async function savePass1(ctx: Ctx, id: string): Promise<{ words: number; 
 }
 
 // ── 4. detect ───────────────────────────────────────────────────────────────
-export async function detectPii(ctx: Ctx, src: Source, pass1: { avgConf: number; crosstalk: number }) {
-  "use step";
-  const attempt = getStepMetadata().attempt;
+// `attempt` (the step retry, from lib/retry.ts) keeps the cost-ledger item keys unique per paid call
+export async function detectPii(ctx: Ctx, src: Source, pass1: { avgConf: number; crosstalk: number }, attempt = 1) {
   const inp = await inputs(ctx);
   const { transcript: t, entities } = await getWorkJson<Pass1>(ctx.jobId, ctx.runId, "asr-pass1.json");
 
@@ -225,7 +217,6 @@ export async function detectPii(ctx: Ctx, src: Source, pass1: { avgConf: number;
 
 // ── 5. audio ────────────────────────────────────────────────────────────────
 export async function renderAudio(ctx: Ctx, src: Source): Promise<{ sha256: string; bytes: number; pitchEngine: PitchEngine }> {
-  "use step";
   const dir = await scratch(ctx.jobId);
   try {
     const source = path.join(dir, "source.mp3"), pcm = path.join(dir, "mono.pcm"), out = path.join(dir, "redacted.mp3");
@@ -252,7 +243,6 @@ export async function renderAudio(ctx: Ctx, src: Source): Promise<{ sha256: stri
 
 // ── 6. transcript artifacts ─────────────────────────────────────────────────
 export async function writeTranscriptArtifacts(ctx: Ctx, src: Source) {
-  "use step";
   const { transcript: t } = await getWorkJson<Pass1>(ctx.jobId, ctx.runId, "asr-pass1.json");
   const { spans, bleeps } = await getWorkJson<SpansFile>(ctx.jobId, ctx.runId, "spans.json");
   const lines = redactedLines(t, spans, bleeps, ctx.options.customer_channel, ctx.options.bleep_pad_ms, src.durationMs);
@@ -279,9 +269,7 @@ export async function writeTranscriptArtifacts(ctx: Ctx, src: Source) {
 }
 
 // ── 7. smart clips + coaching (SPEC v0.2 §2.6–2.7) ──────────────────────────
-export async function clipsAndCoaching(ctx: Ctx, src: Source) {
-  "use step";
-  const stepAttempt = getStepMetadata().attempt;
+export async function clipsAndCoaching(ctx: Ctx, src: Source, stepAttempt = 1) {
   const inp = await inputs(ctx);
   const lines = await getWorkJson<RedactedLine[]>(ctx.jobId, ctx.runId, "redacted-lines.json");
   const { bleeps } = await getWorkJson<SpansFile>(ctx.jobId, ctx.runId, "spans.json");
@@ -368,7 +356,6 @@ export async function clipsAndCoaching(ctx: Ctx, src: Source) {
 const PII_ENTITY_TYPES = new Set(Object.keys(AAI_ENTITY_MAP));
 
 export async function verifySecondPass(ctx: Ctx, id: string): Promise<string[]> {
-  "use step";
   const raw = await getTranscript(id);
   if (raw.status !== "completed") throw jobError("asr_failed", `pass2 status ${raw.status}`);
   const t2 = fromAssemblyAi(raw, 0);
@@ -403,7 +390,6 @@ export async function completeJob(ctx: Ctx, payload: {
   metrics: Record<string, unknown>;
   engine: Record<string, string>;
 }) {
-  "use step";
   const artifacts = Object.fromEntries(Object.entries(payload.artifacts).filter(([, v]) => v));
   const { clips, coaching } = await getWorkJson<ClipsFile>(ctx.jobId, ctx.runId, "clips-meta.json");
   const r = await bridge<{ library_call_id: string }>("complete", {
@@ -431,7 +417,6 @@ export async function completeJob(ctx: Ctx, payload: {
  * ever recorded for the job, which are then deleted. Never throws.
  */
 export async function purgeJobs(jobIds: string[]): Promise<{ jobs: number; transcripts: number; failed: number }> {
-  "use step";
   let transcripts = 0, failed = 0;
   for (const jobId of jobIds) {
     try {
@@ -448,18 +433,14 @@ export async function purgeJobs(jobIds: string[]): Promise<{ jobs: number; trans
 }
 
 /** Delete AssemblyAI's copies. Never throws: a leftover id stays on the job row for the delete action. */
-export async function purgeAsr(ids: string[]): Promise<{ purged: number; failed: number }> {
-  "use step";
-  let purged = 0, failed = 0;
-  for (const id of ids) {
-    if (await deleteTranscript(id)) purged++; else failed++;
-  }
-  log("asr_purged", { purged, failed });
-  return { purged, failed };
+export async function purgeAsr(ids: string[]): Promise<{ purged: number; failed: number; deleted: string[] }> {
+  const deleted: string[] = [];
+  for (const id of ids) if (await deleteTranscript(id)) deleted.push(id);
+  log("asr_purged", { purged: deleted.length, failed: ids.length - deleted.length });
+  return { purged: deleted.length, failed: ids.length - deleted.length, deleted };
 }
 
 export async function failJob(jobId: string, runId: string, code: string, detail: string) {
-  "use step";
   try {
     await bridge("fail", { job_id: jobId, run_id: runId, error_code: code, error_detail: detail, pipeline_version: PIPELINE_VERSION });
   } catch (e) {

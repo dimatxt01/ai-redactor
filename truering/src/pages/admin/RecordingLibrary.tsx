@@ -100,9 +100,9 @@ export default function RecordingLibrary({ portal = "admin" }: { portal?: "admin
 
   const runDelete = async (callId: string) => {
     try {
-      const r = await invoke<{ ok?: boolean; vendor_purged?: boolean; vendor_detail?: string | null }>({ action: "delete", call_id: callId });
-      if (r?.vendor_purged === false) {
-        toast({ title: "Removed from TR; vendor copy not confirmed yet — run delete again", description: r.vendor_detail ?? undefined, variant: "destructive" });
+      const r = await invoke<{ ok?: boolean; deleted?: number; pending_worker?: number }>({ action: "delete", call_id: callId });
+      if (r?.pending_worker) {
+        toast({ title: "Removed from TR", description: "The worker deletes the transcription vendor's copies on its next poll (usually under a minute); the job then shows as deleted." });
       } else toast({ title: "Every copy deleted" });
     } catch (e) {
       toast({ title: "Delete failed", description: e instanceof Error ? e.message : String(e), variant: "destructive" });
@@ -297,7 +297,7 @@ function SubmitDialog({ call, reprocess, onClose, onDone }: { call: PickRow; rep
           extra_terms: terms.split("\n").map((t) => t.trim()).filter(Boolean),
         },
       });
-      toast({ title: r.existing ? "Already submitted" : "Submitted", description: r.idempotency_key });
+      toast({ title: r.existing ? "Already submitted" : "Queued: the worker picks it up within about 20 s", description: r.idempotency_key });
       onDone();
     } catch (e) {
       toast({ title: "Not submitted", description: e instanceof Error ? e.message : String(e), variant: "destructive" });
@@ -360,7 +360,7 @@ function Jobs({ jobs, loading, onChanged }: { jobs: JobRow[]; loading: boolean; 
                 <TableCell>
                   <Badge variant={statusTone(j.status)}>{j.status}</Badge>
                   {j.error_code && <div className="mt-1 text-xs text-destructive">{j.error_code}{j.error_detail ? `: ${j.error_detail}` : ""}</div>}
-                  {j.delete_requested_at && !j.deleted_at && <div className="mt-1 text-xs">takedown pending vendor confirmation</div>}
+                  {j.delete_requested_at && !j.deleted_at && <div className="mt-1 text-xs">takedown: waiting for the worker to delete the vendor copies</div>}
                 </TableCell>
                 <TableCell>{j.status !== "done" ? "—" : j.qa_flag ? <Badge variant="destructive">{j.qa_reasons.length} flags</Badge> : <Badge variant="secondary">clean</Badge>}</TableCell>
                 <TableCell>

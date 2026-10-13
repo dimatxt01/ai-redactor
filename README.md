@@ -1,119 +1,97 @@
 # ai-redactor
 
-TrueRing's Recording Library worker. It takes a Final Expense sale call, bleeps every piece of personal data, and cuts up to 6 coaching clips, for internal training. This repo is its own **Vercel project**, deployed separately from TrueRing. It talks to TrueRing only through two signed HTTP endpoints.
+TrueRing's Recording Library worker. It takes a Final Expense sale call, bleeps every piece of personal data, and cuts up to 6 coaching clips, for internal training.
 
-**Status: nothing deployed or applied.** Built to SPEC v0.2 ([`truering/docs/recording-library/SPEC.md`](truering/docs/recording-library/SPEC.md)). It sits on top of TrueRing's RL-1 (live since 2026-10-13).
+It is a **plain Node background process**: one long-running container. It opens no port and receives no traffic. It **pulls** its work from TrueRing through one signed endpoint, `sample-redaction-bridge`, and sends every result back the same way.
+
+**Status: nothing deployed or applied.** Built to SPEC v0.2 ([`truering/docs/recording-library/SPEC.md`](truering/docs/recording-library/SPEC.md)), on top of TrueRing's RL-1 (live since 2026-10-13).
 
 ## How it connects to TrueRing
 
 ```
-TrueRing (Supabase)                                               ai-redactor (this repo, Vercel)
-───────────────────                                               ──────────────────────────────
-/am/recording-library, /admin/recording-library  (flag recording_library)
-   │
-   ▼
-training-library-admin  ── POST /api/jobs, /api/delete ──────────► app/api/jobs, app/api/delete
- (edge function)           HMAC: SAMPLE_REDACTOR_START_SECRET          │ one durable Workflow run per job
-                                                                       ▼
-sample-redaction-bridge ◄── every read, status write, signed URL ── workflows/redact-call.ts
- (edge function)            HMAC: SAMPLE_REDACTOR_BRIDGE_SECRET        ├─ AssemblyAI (transcribe ×2)
-   │                                                                   └─ OpenRouter (PII labels, clips, coaching)
-   ▼
-sample_redaction_jobs · training_library_* (RL-1) · storage sample-src/<job_id>/, training-library/<job_id>/
+TrueRing (Supabase)                                                     ai-redactor (this repo; any container host)
+───────────────────                                                     ───────────────────────────────────────────
+/am/recording-library  ──►  training-library-admin  ──►  sample_redaction_jobs (status 'queued')
+ (AM picks a call)            (edge function)                  ▲
+                                                               │ claim, status, signed storage URLs, results
+                              sample-redaction-bridge  ◄───────┴──── poll every 20 s ──── src/worker.ts
+                              (edge function, HMAC)                  (outbound HTTPS only)   ├─ AssemblyAI (transcribe ×2)
+                                                                                             └─ OpenRouter (PII labels, clips, coaching)
+storage: sample-src/<job_id>/ (scratch) · training-library/<job_id>/ (results)  ←  the worker uploads through bridge-signed URLs
 ```
 
-- **The worker holds no Supabase key.** The bridge is its only way into TrueRing, and each call is scoped to one job.
-- **Each direction has its own secret.** Requests are signed `X-TR-Signature: t=<unix>,v1=<hmac>` and accepted for ±300 s.
-- **The service is input/output only.** It has no database, tables, buckets or Supabase key. Every recording, clip, transcript and coaching note is stored on TrueRing's side. Temp files and AssemblyAI's copies are deleted every run, and OpenRouter keeps nothing. Results come back by **pull through the bridge**, with no callback (SPEC v0.2, delivery revised 2026-10-13).
-- **The only state on Vercel is the Workflow run log:** ids, hashes and counts, never content. Every run starts with retention 0 (`lib/config.ts` `RUN_OPTIONS`), so its payloads are deleted as soon as it ends.
-- **[`truering/`](truering/) is a REFERENCE COPY ONLY** of the TrueRing side: the migration, the two edge functions, the curation page and the wiring edits. They are applied **only from `Mahamadou2004/truering`** (branch `feat/sample-redaction`), never from this repo. See [`truering/README.md`](truering/README.md).
+- **TrueRing never calls the worker.** Submit and retry just queue the job. Each `poll` from the worker:
+  - claims queued jobs (a compare-and-swap, so two workers never run the same job);
+  - refreshes the heartbeat of the jobs it runs, and learns which of them to stop (takedowns);
+  - gets the finished jobs whose AssemblyAI copies still need deleting.
+- **If a worker dies mid-job,** its heartbeat goes stale. After 5 min the bridge fails the job and purges its files, the next poll deletes its vendor copies, and the AM presses retry.
+- **One shared secret,** `SAMPLE_REDACTOR_BRIDGE_SECRET`. Requests are signed `X-TR-Signature: t=<unix>,v1=<hmac>` and accepted for ±300 s.
+- **Input/output only.** The worker has no database, tables, buckets or Supabase key. Every recording, clip, transcript and coaching note is stored on TrueRing's side. Temp files are deleted at the end of every step, AssemblyAI's copies at the end of every job, and OpenRouter keeps nothing (ZDR).
+- **[`truering/`](truering/) is a REFERENCE COPY ONLY** of the TrueRing side, applied only from `Mahamadou2004/truering` (branch `feat/sample-redaction`). See [`truering/README.md`](truering/README.md).
+
+## Run it
+
+```bash
+npm ci                         # also checks the bundled ffmpeg binary is there
+npm run check -- --bridge      # self-test: env present, ffmpeg runs, one signed poll to the bridge works
+npm start                      # the worker (stops cleanly on SIGTERM)
+docker build -t ai-redactor . && docker run --env-file .env.local ai-redactor     # or as a container
+```
+
+| Env | |
+|---|---|
+| `TR_BRIDGE_URL` | `https://<project>.supabase.co/functions/v1/sample-redaction-bridge` |
+| `SAMPLE_REDACTOR_BRIDGE_SECRET` | The same value as the TrueRing Supabase function secret of that name. |
+| `ASSEMBLYAI_API_KEY`, `OPENROUTER_API_KEY` | Vendor keys, with zero-retention / no-training terms. |
+| optional | `WORKER_CONCURRENCY` (2), `POLL_S` (20), `ASR_POLL_S` (10), `ASSEMBLYAI_SPEECH_MODEL`, `OPENROUTER_MODEL`. Changing a model means bumping `PIPELINE_VERSION`. |
+
+**Host.** Any always-on container host: Fly.io, Railway, Render, ECS or a VM.
+- Needs outbound HTTPS only (no inbound port) and 1 vCPU / 1 GB RAM for 2 jobs at a time.
+- Run **one** instance. A second one during a rollover is safe: the claim keeps every job to one run.
+- The Docker `HEALTHCHECK` fails when no poll succeeded for 3 minutes.
+- Logs are JSON lines with ids and counts only.
 
 ## Test it
 
 ```bash
-npm ci
 npm run simulate                  # the whole system on this machine, no keys, nothing live (~1 min)
 npm run validate -- --offline     # every check incl. the simulation; no vendor calls
 npm run validate                  # + the real-vendor eval if ASSEMBLYAI_API_KEY / OPENROUTER_API_KEY are set (~$1.60)
-bash truering/check.sh /path/to/truering   # read-only TrueRing-side checks inside a checkout of Mahamadou2004/truering feat/sample-redaction
+bash truering/check.sh /path/to/truering   # read-only TrueRing-side checks inside a checkout of feat/sample-redaction
 ```
 
-Prerequisites: Node ≥22 and PostgreSQL 15+ (`brew install postgresql@17`). Deno comes via `npx`. Generating the test calls needs macOS `say`.
+Prerequisites: Node 22 and PostgreSQL 15+ (`brew install postgresql@17`). Deno comes via `npx`. Generating the test calls needs macOS `say`.
 
-### `npm run simulate`: how it would work, end to end
+**`npm run simulate`** runs the real code on both sides:
+- **Real:** two worker processes, `training-library-admin` and `sample-redaction-bridge` (unchanged, under Deno), and the RL-1 + worker migrations on a throwaway Postgres.
+- **Faked:** only Supabase's HTTP layer, Telnyx, AssemblyAI and OpenRouter. On the verification pass, the fake AssemblyAI listens to the redacted mp3 for the bleep tone, so an unbleeped value stays audible.
 
-It runs the real code on both sides and fakes only what lives outside both repos:
+It checks, from TrueRing's side:
+1. **Auth:** wrong secrets are refused; a worker with a wrong secret refuses to start.
+2. **Submit rules:** the flag, scope, consent and the month cap.
+3. **The happy path:** queued → done, with clips, coaching and cleanup.
+4. **Two workers racing:** exactly one run does the work.
+5. **Recording gone:** `fetch_expired`, then a retry succeeds.
+6. **QA gate:** approve is refused until everything was played, then publish works.
+7. **Delete every copy.**
+8. **Takedown while a worker is mid-job:** the worker stops on its next poll, and the job is `deleted` once it confirms.
+9. **A worker killed mid-job:** the bridge fails the job, the other worker deletes its vendor copy, a retry finishes it, and SIGTERM exits cleanly.
+10. **Privacy:** every planted value is checked as bleeped in the audio and every clip (with a control on the original recording). Every artifact, table and log is searched for planted values, and the worker's temp dirs must be empty.
 
-| Real | Faked (`sim/`) |
-|---|---|
-| The worker: `next build` + `next start`, on the local Workflow runtime | Supabase's HTTP layer: the same queries, on a throwaway Postgres (`sim/supabase/fake-supabase.ts`); storage on disk |
-| `training-library-admin` and `sample-redaction-bridge`, unchanged, under Deno | Telnyx: serves the test call's mp3 |
-| RL-1 plus this repo's migration, on Postgres 17 | AssemblyAI: returns the call's words. On the second pass it **listens** to the redacted mp3 for the bleep tone, so an unbleeped value stays audible, as it would with the real vendor |
-| | OpenRouter: a valid clips and coaching answer. Each job's first answer is deliberately invalid, so the worker's one retry gets exercised |
-
-It plays an AM through the real admin function and checks every outcome from TrueRing's side:
-
-1. Wrong secrets in either direction are refused, and non-staff users are refused.
-2. Submit rules:
-   - flag off → refused;
-   - Twilio-era call → refused;
-   - agent with no consent → refused;
-   - the $100/month cap → refused, and the ops alert event is logged.
-3. A submit runs through every stage: queued → fetching → transcribing → redacting → verifying → done. The result is a `pending_qa` library row, ≤6 clips with the fixed labels (`application` clips are never exported), and call coaching. Scratch files are emptied and the vendor copies deleted. The cost is recorded under $2.
-4. A start that pairs a job with another call's key leaves the job untouched. The same start delivered twice: exactly one run does the work.
-5. When the recording is gone, the job fails with `fetch_expired` and leaves nothing behind. A retry then succeeds.
-6. QA: approve is refused until the call and every clip have been played; then approve and publish work.
-7. Delete every copy:
-   - both storage buckets are emptied, the library row is withdrawn and emptied, and the vendor copies are gone;
-   - the call can't be sampled again, and the bridge refuses the deleted job.
-8. Privacy:
-   - **Audio:** every planted value is checked in the redacted call and in every clip. A control run of the same listener on the original recording must hear all of them.
-   - **Text:** every artifact and table is searched for planted values.
-   - **Logs and Workflow event log:** searched too; the event log's step inputs are decoded first, with a control that must find the job ids.
-
-The output goes to `sim-out/<time>/`:
-- `report.md`;
-- `storage/`, every file TrueRing would hold, so you can listen to `training-library/<job_id>/redacted.mp3` and `clips/cN.mp3`;
-- `logs/`.
-
-## Deploy (each step its own go)
-
-1. **TrueRing (in `Mahamadou2004/truering`, never from here):**
-   - Review and merge branch `feat/sample-redaction`. `bash truering/check.sh <checkout>` runs its checks.
-   - Apply migration `20261013090000_sample_redaction_worker.sql` (TrueRing's `apply-migration` skill), then redeploy `integrity-audit`.
-   - Set the secrets below, then deploy `training-library-admin`, `sample-redaction-bridge` and `ops-alert`.
-2. **This repo:**
-   - Vercel project `ai-redactor` (team `piskundzmitry-1528's projects`). Created 2026-10-13 with no env vars and no Git link.
-   - Set the env below, deploy, and check `GET /api/health`: `ok` and `ffmpeg.ok` must be true (it answers 503 without the binary), and `configured` must show all true.
-3. **TrueRing frontend:** deploy it. The page stays hidden while the flag is off.
-4. **Pilot:** arm `recording_library` (TrueRing FLAGS §76) and run 5 internal calls with offline consent. Listen to every file and clip. Confirm the Telnyx channel order.
-
-| Where | Required | Optional |
-|---|---|---|
-| Vercel (this repo) | `TR_BRIDGE_URL` = `https://<project>.supabase.co/functions/v1/sample-redaction-bridge`, `SAMPLE_REDACTOR_BRIDGE_SECRET`, `SAMPLE_REDACTOR_START_SECRET`, `ASSEMBLYAI_API_KEY`, `OPENROUTER_API_KEY` | `ASSEMBLYAI_SPEECH_MODEL`, `OPENROUTER_MODEL` (changing one = bump `PIPELINE_VERSION`) |
-| TrueRing function secrets | `SAMPLE_REDACTOR_URL` (this deployment's URL), `SAMPLE_REDACTOR_START_SECRET`, `SAMPLE_REDACTOR_BRIDGE_SECRET` (same values as Vercel) | `SAMPLE_JOB_CAP_USD` (2), `SAMPLE_MONTH_CAP_USD` (100), `SAMPLE_ASR_USD_PER_HOUR` (0.45; set it to the contracted rate). `TELNYX_API_KEY` already exists. |
-
-Outside the repo:
-- AssemblyAI and OpenRouter zero-retention and no-training agreements. The pinned OpenRouter model must have a ZDR endpoint, or every call fails closed.
-- A Supabase upload limit of at least 200 MB.
-- Vercel Deployment Protection off for `/.well-known/workflow/v1/webhook/*` (AssemblyAI calls it) and `/api/*` (HMAC-protected).
-
-Rollback, in order:
-1. Disarm `recording_library`.
-2. Unset `SAMPLE_REDACTOR_URL`, or delete the Vercel project.
-3. Undeploy the two functions.
-4. Run `truering/scripts/rollbacks/rollback_20261013090000_sample_redaction_worker.sql`. RL-1 stays.
+Output: `sim-out/<time>/report.md`, `storage/` (every file TrueRing would hold, so you can listen to them) and `logs/`.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `app/api/{jobs,delete,health}` | The worker's HTTP surface: start a job, delete every vendor copy, health. |
-| `workflows/` | The durable pipeline: claim → fetch → transcribe → detect → render → clips + coaching → verify → complete. |
-| `lib/` | Detectors (`pii/`), audio DSP (`audio.ts`), clips + coaching (`labels.ts`), QA (`qa.ts`), the bridge client, option defaults, costs, logs. |
+| `src/worker.ts` | The process: poll loop, concurrency, stop requests, vendor cleanup, graceful shutdown. |
+| `src/check.ts` | The self-test (`npm run check`); the worker runs it at startup and refuses to start on a failure. |
+| `lib/job.ts` | One job: claim → fetch → transcribe → detect → render → clips + coaching → verify → complete. |
+| `lib/steps.ts` | The steps. Each does its own I/O and passes only ids, hashes, counts and offsets onward. |
+| `lib/` | Also: detectors (`pii/`), audio DSP (`audio.ts`), clips + coaching (`labels.ts`), QA (`qa.ts`), the bridge client, retries, option defaults, costs, logs. |
 | `test/` | Unit tests (`npm test`). |
-| `fixtures/calls/` | 12 synthetic two-voice calls with planted, fictional PII (`npm run make-test-calls` renders them). |
-| `scripts/` | `validate.sh`, `eval-test-calls.ts` (real vendors), `signature-parity.ts` (TrueRing ↔ worker HMAC), `check-ffmpeg.mjs`. |
-| `sim/` | The end-to-end simulation (`npm run simulate`). |
-| `truering/` | Reference copy of the TrueRing side (never applied from here) + `refresh.sh`, `check.sh`, `FILES`, `existing-files.patch`. |
-| `docs/DESIGN.md` | The pipeline in detail, how each requirement is met, deliberate deviations from SPEC v0.2, the 2026-10-13 review item by item. |
+| `fixtures/calls/` | 12 synthetic two-voice calls with planted, fictional PII. |
+| `scripts/` | `validate.sh`, `eval-test-calls.ts` (real vendors), `signature-parity.ts`, `check-ffmpeg.mjs`. |
+| `sim/` | The end-to-end simulation. |
+| `truering/` | Reference copy of the TrueRing side (never applied from here) + `refresh.sh`, `check.sh`. |
+| `docs/DESIGN.md` | The pipeline in detail, how each requirement is met, deviations from SPEC, the review answers. |

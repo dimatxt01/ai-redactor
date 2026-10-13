@@ -12,9 +12,11 @@
 //                                             Server-side because calls RLS limits an AM to their own book, and AM
 //                                             curation is global (Dmitry 2026-10-12 6:47 PM CT).
 //   submit   {call_id, options, reprocess?}   flag recording_library ON; Final Expense Sale, Telnyx, 60–3600 s, active
-//                                             agent consent; idempotent per call:<id>:v<n>; reserves the estimate; starts the worker
-//   retry    {job_id}                         failed job → same key, restarted (spec §4 fetch_expired)
-//   sweep    {}                               non-terminal jobs older than 2h → failed:timeout, copies purged
+//                                             agent consent; idempotent per call:<id>:v<n>; reserves the estimate; queues the job
+//                                             (the worker picks it up on its next bridge poll; TR never calls the worker)
+//   retry    {job_id}                         failed job → same key, queued again (spec §4 fetch_expired)
+//   sweep    {}                               non-terminal jobs older than 2h → failed:timeout, copies purged (the worker's
+//                                             next poll deletes their vendor copies)
 //   link     {library_call_id, artifact}      10-min signed URL, logged (the log is the listen evidence).
 //            artifact: audio | transcript_json | transcript_txt | pii_spans_json | clips_json | coaching_json | clip:<clip uuid>
 //   review   {library_call_id, decision: approve|reject, listened_full, notes?}
@@ -22,16 +24,16 @@
 //   publish  {library_call_id}                status → published; the RL-1 trigger checks latest review + active consent
 //   withdraw {library_call_id, notes?}        'withdraw' review + status → withdrawn
 //   edit     {library_call_id, title?, tags?, clip_titles?: {<clip uuid>: title}, drop_clip_ids?: [uuid]}  not while published
-//   delete   {call_id}                        takedown of every copy: tombstone FIRST, runs cancelled + vendor transcripts deleted
-//                                             via the worker, both buckets purged, library rows withdrawn and emptied;
-//                                             job status 'deleted' only once the worker confirmed (200). 207 = retry later.
+//   delete   {call_id}                        takedown of every copy: tombstone FIRST, running jobs failed (their worker stops on its
+//                                             next poll), both buckets purged, library rows withdrawn and emptied. A job with no
+//                                             vendor copy and no live run is 'deleted' at once; otherwise the bridge marks it
+//                                             'deleted' when the worker reports its AssemblyAI copies gone (pending_worker).
 //
 // Cost caps: submit/retry reserve the estimate against SAMPLE_MONTH_CAP_USD (default 100) atomically in SQL; an estimate
 // over SAMPLE_JOB_CAP_USD (default 2) is refused. A month-cap refusal logs sample_cost_cap_blocked (ops-alert raises it).
 // The worker enforces both caps again on actual spend.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { signSampleBody } from '../_shared/sampleSignature.ts';
 import { isTelnyxRecordingUrl } from '../_shared/telnyxRecording.ts';
 import { stateFromNumber } from '../_shared/npaState.ts';
 import { flagEnabled } from '../_shared/featureFlags.ts';
@@ -44,8 +46,8 @@ const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
 const STAFF = new Set(['admin', 'superadmin', 'account_manager']);
-const WORKER_BUDGET_MS = 10_000;
-const DELETE_BUDGET_MS = 45_000;
+// a running job's worker polls the bridge every ~20 s; a heartbeat older than this means no live run owns it
+const STALE_MS = Number(Deno.env.get('SAMPLE_WORKER_STALE_S') || 300) * 1000;
 const JOB_DEADLINE_MS = 2 * 60 * 60 * 1000;
 const FILES: Record<string, string> = {
   transcript_json: 'transcript.json', transcript_txt: 'transcript.txt', pii_spans_json: 'pii_spans.json',
@@ -106,41 +108,6 @@ Deno.serve(async (req) => {
   const logEvent = async (event_type: string, metadata: Record<string, unknown>) => {
     const { error } = await admin.from('security_activity_log').insert({ event_type, user_id: userId, portal, metadata });
     if (error) console.error('[training-library-admin] log failed:', event_type, error.message);
-  };
-
-  const callWorker = async (path: string, payload: unknown, budgetMs: number): Promise<{ ok: boolean; status: number; body: any; detail?: string }> => {
-    const base = Deno.env.get('SAMPLE_REDACTOR_URL');
-    const secret = Deno.env.get('SAMPLE_REDACTOR_START_SECRET');
-    if (!base || !secret) return { ok: false, status: 0, body: null, detail: 'SAMPLE_REDACTOR_URL / SAMPLE_REDACTOR_START_SECRET not set' };
-    const raw = JSON.stringify(payload);
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), budgetMs);
-    try {
-      const res = await fetch(`${base.replace(/\/$/, '')}${path}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-TR-Signature': await signSampleBody(secret, raw) },
-        body: raw,
-        signal: ctl.signal,
-      });
-      const j = await res.json().catch(() => ({}));
-      // only a 200 is a full success; /api/delete answers 207 when some copy could not be removed yet
-      return { ok: res.status === 200 || res.status === 202, status: res.status, body: j, detail: res.ok && res.status !== 207 ? undefined : `worker ${res.status}` };
-    } catch (e) {
-      return { ok: false, status: 0, body: null, detail: `worker unreachable: ${e instanceof Error ? e.message : String(e)}` };
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-
-  const startWorker = async (jobId: string, idempotencyKey: string) => {
-    const r = await callWorker('/api/jobs', { job_id: jobId, idempotency_key: idempotencyKey }, WORKER_BUDGET_MS);
-    return r.ok ? { ok: true as const, runId: r.body?.run_id as string | undefined } : { ok: false as const, detail: r.detail ?? 'worker start failed' };
-  };
-
-  const markStartFailed = async (jobId: string, detail: string) => {
-    await admin.from('sample_redaction_jobs').update({
-      status: 'failed', error_code: 'internal', error_detail: detail.slice(0, 500), completed_at: new Date().toISOString(),
-    }).eq('id', jobId).eq('status', 'queued');
   };
 
   const purge = async (bucket: string, prefix: string): Promise<number> => {
@@ -275,16 +242,8 @@ Deno.serve(async (req) => {
         if (ins?.reason === 'deleted') return json({ error: 'this call was taken down', error_code: 'DELETED' }, 409);
         return json({ error: 'a job for this version already exists', error_code: 'DUPLICATE' }, 409);
       }
-      const jobId = String(ins.job_id);
-      const idempotencyKey = String(ins.idempotency_key);
-
-      const started = await startWorker(jobId, idempotencyKey);
-      if (!started.ok) {
-        console.error('[training-library-admin] worker start failed:', jobId, started.detail);
-        await markStartFailed(jobId, started.detail);
-        return json({ error: started.detail, error_code: 'WORKER_START_FAILED', job_id: jobId }, 502);
-      }
-      return json({ job_id: jobId, idempotency_key: idempotencyKey, version, run_id: started.runId, reserved_usd: estimate });
+      // queued: the worker claims it on its next bridge poll
+      return json({ job_id: String(ins.job_id), idempotency_key: String(ins.idempotency_key), version, status: 'queued', reserved_usd: estimate });
     }
 
     case 'retry': {
@@ -308,22 +267,17 @@ Deno.serve(async (req) => {
         const [msg, code, status] = map[String(r?.reason)] ?? ['retry refused', 'REFUSED', 409];
         return json({ error: msg, error_code: code }, status);
       }
-      const started = await startWorker(jobId, String(r.idempotency_key));
-      if (!started.ok) {
-        await markStartFailed(jobId, started.detail);
-        return json({ error: started.detail, error_code: 'WORKER_START_FAILED' }, 502);
-      }
-      return json({ job_id: jobId, run_id: started.runId });
+      return json({ job_id: jobId, status: 'queued' });
     }
 
     case 'sweep': {
       const cutoff = new Date(Date.now() - JOB_DEADLINE_MS).toISOString();
       const { data: stale, error } = await admin.from('sample_redaction_jobs').update({
         status: 'failed', error_code: 'timeout', error_detail: 'job exceeded 2h (sweep)', completed_at: new Date().toISOString(),
-      }).not('status', 'in', '(done,failed,deleted)').lt('created_at', cutoff).select('id, workflow_run_id, asr_transcript_ids');
+      }).not('status', 'in', '(done,failed,deleted)').lt('created_at', cutoff).select('id');
       if (error) return json({ error: error.message, error_code: 'DB' }, 500);
       if (!stale?.length) return json({ timed_out: 0 });
-      // the dead run left raw audio + transcripts in scratch: purge now, and again after its signed URLs expire
+      // the dead run left raw audio + transcripts in scratch: purge now (its vendor copies go on the worker's next poll)
       for (const j of stale) {
         try {
           await purge(SRC, j.id);
@@ -332,13 +286,7 @@ Deno.serve(async (req) => {
           console.error('[training-library-admin] sweep purge failed:', j.id, e instanceof Error ? e.message : 'error');
         }
       }
-      const w = await callWorker('/api/delete', {
-        job_ids: stale.map((j) => j.id),
-        run_ids: stale.map((j) => j.workflow_run_id).filter(Boolean),
-        transcript_ids: stale.flatMap((j) => j.asr_transcript_ids ?? []),
-      }, DELETE_BUDGET_MS);
-      if (!w.ok) console.error('[training-library-admin] sweep vendor purge failed:', w.detail);
-      return json({ timed_out: stale.length, vendor_purged: w.ok });
+      return json({ timed_out: stale.length });
     }
 
     case 'link': {
@@ -467,31 +415,18 @@ Deno.serve(async (req) => {
       const { error: tombErr } = await admin.from('sample_redaction_jobs')
         .update({ delete_requested_at: nowIso }).eq('call_id', callId).is('delete_requested_at', null);
       if (tombErr) return json({ error: tombErr.message, error_code: 'DB' }, 500);
+      // a running job fails here; its worker sees the tombstone on its next poll and stops
       await admin.from('sample_redaction_jobs').update({
         status: 'failed', error_code: 'internal', error_detail: 'deleted by staff', completed_at: nowIso,
       }).eq('call_id', callId).not('status', 'in', '(done,failed,deleted)');
 
       const { data: jobs, error: jobsErr } = await admin
-        .from('sample_redaction_jobs').select('id, workflow_run_id, deleted_at').eq('call_id', callId);
+        .from('sample_redaction_jobs').select('id, status, heartbeat_at, asr_transcript_ids, deleted_at').eq('call_id', callId);
       if (jobsErr) return json({ error: jobsErr.message, error_code: 'DB' }, 500);
       if (!jobs?.length) return json({ error: 'no samples for this call', error_code: 'NOT_FOUND' }, 404);
       const jobIds = jobs.map((j) => j.id);
 
-      // 2. the worker: cancel runs, wait for them to stop, delete vendor transcripts, schedule a late re-purge
-      const w = await callWorker('/api/delete', {
-        job_ids: jobIds,
-        run_ids: jobs.map((j) => j.workflow_run_id).filter(Boolean),
-        transcript_ids: [],   // re-read after the runs stopped:
-      }, DELETE_BUDGET_MS);
-      // ids recorded while runs were stopping are only visible now
-      const { data: ids } = await admin.from('sample_redaction_jobs').select('asr_transcript_ids').eq('call_id', callId);
-      const transcriptIds = (ids ?? []).flatMap((r) => r.asr_transcript_ids ?? []);
-      const w2 = transcriptIds.length
-        ? await callWorker('/api/delete', { job_ids: [], run_ids: [], transcript_ids: transcriptIds }, DELETE_BUDGET_MS)
-        : { ok: true, status: 200, detail: undefined };
-      const vendor = { ok: w.status === 200 && w2.status === 200, detail: w.detail ?? w2.detail ?? null };
-
-      // 3. TR copies: every job's scratch and artifacts
+      // 2. TR copies: every job's scratch and artifacts (the bridge purges again when the worker confirms)
       const removed: Record<string, number> = { [LIB]: 0, [SRC]: 0 };
       try {
         for (const id of jobIds) {
@@ -502,7 +437,7 @@ Deno.serve(async (req) => {
         return json({ error: `storage purge failed: ${e instanceof Error ? e.message : String(e)}`, error_code: 'STORAGE', removed }, 500);
       }
 
-      // 4. library rows stay as the take-down record, withdrawn and emptied of audio paths and generated text
+      // 3. library rows stay as the take-down record, withdrawn and emptied of audio paths and generated text
       const { data: libs } = await admin.from('training_library_calls').select('id, status').in('job_id', jobIds);
       for (const l of libs ?? []) {
         if (l.status !== 'withdrawn') {
@@ -515,13 +450,17 @@ Deno.serve(async (req) => {
         await admin.from('training_library_clips').update({ audio_path: null, audio_sha256: null, audio_exported: false, coaching: {}, title: null })
           .eq('library_call_id', l.id);
       }
-      // 5. 'deleted' only once the worker confirmed every vendor copy is gone; otherwise the action is offered again
-      if (vendor.ok) {
-        await admin.from('sample_redaction_jobs').update({ status: 'deleted', deleted_at: nowIso })
-          .eq('call_id', callId).is('deleted_at', null);
+
+      // 4. 'deleted' now where nothing is left for the worker: no AssemblyAI copy and no live run. The rest
+      //    become 'deleted' when the worker reports their vendor copies gone (bridge `vendor_purged`).
+      const live = (j: { heartbeat_at: string | null }) => !!j.heartbeat_at && Date.now() - new Date(j.heartbeat_at).getTime() <= STALE_MS;
+      const done = jobs.filter((j) => !j.deleted_at && !(j.asr_transcript_ids ?? []).length && !live(j)).map((j) => j.id);
+      if (done.length) {
+        await admin.from('sample_redaction_jobs').update({ status: 'deleted', deleted_at: nowIso }).in('id', done).is('deleted_at', null);
       }
-      await logEvent('training_library_deleted', { call_id: callId, jobs: jobs.length, removed, vendor_purged: vendor.ok, vendor_detail: vendor.detail });
-      return json({ ok: vendor.ok, removed, vendor_purged: vendor.ok, vendor_detail: vendor.detail }, vendor.ok ? 200 : 207);
+      const pending = jobs.filter((j) => !j.deleted_at && !done.includes(j.id)).length;
+      await logEvent('training_library_deleted', { call_id: callId, jobs: jobs.length, removed, pending_worker: pending });
+      return json({ ok: true, removed, deleted: done.length, pending_worker: pending });
     }
 
     default:

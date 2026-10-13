@@ -14,7 +14,7 @@ export function safeValue(v: Field): string | number | boolean | null {
 }
 
 export function log(event: string, fields: Record<string, Field> = {}): void {
-  const out: Record<string, unknown> = { svc: "sample-redactor", event: safeValue(event) };
+  const out: Record<string, unknown> = { svc: "ai-redactor", event: safeValue(event) };
   for (const [k, v] of Object.entries(fields)) out[k] = safeValue(v);
   console.log(JSON.stringify(out));
 }

@@ -1,7 +1,7 @@
 // AssemblyAI: the dedicated transcriber. It alone produces timestamps.
 // Model pinned (MODELS.asr, exactly one entry in speech_models). The transcript
 // is deleted from AssemblyAI as soon as the job no longer needs it.
-import { RetryableError } from "workflow";
+import { RetryableError } from "./errors";
 import { env, MODELS } from "./config";
 import { jobError } from "./errors";
 
@@ -40,7 +40,6 @@ async function call(path: string, init: RequestInit = {}): Promise<Response> {
 export async function submitTranscript(opts: {
   audioUrl: string;
   multichannel: boolean;
-  webhookUrl?: string;
   keyterms: string[];
 }): Promise<{ id: string }> {
   const res = await call("/transcript", {
@@ -53,7 +52,6 @@ export async function submitTranscript(opts: {
       entity_detection: true,
       punctuate: true,
       format_text: true,
-      ...(opts.webhookUrl ? { webhook_url: opts.webhookUrl } : {}),
       // Names TR already knows (agent, caller) help the model spell them, so the name pass finds them.
       ...(opts.keyterms.length ? { keyterms_prompt: opts.keyterms.slice(0, 200) } : {}),
     }),

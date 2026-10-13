@@ -3,13 +3,13 @@
 The contract is SPEC v0.2 ([`truering/docs/recording-library/SPEC.md`](../truering/docs/recording-library/SPEC.md), byte-identical to TrueRing main) and TR_PLAN ([`truering/docs/recording-library/TR_PLAN.md`](../truering/docs/recording-library/TR_PLAN.md)).
 Paths below are in this repo; TrueRing-side files live under `truering/` at their TrueRing paths.
 
-## Pipeline (one durable Workflow run per job, `workflows/redact-call.ts`)
+## Pipeline (one run per job inside the worker process, `lib/job.ts`)
 
-1. **claim**: compare-and-swap on the job, and the start's `idempotency_key` must match the job row. Only one run can own a job; a duplicate start exits at once. Re-checks the month cap.
+1. **claim**: the worker's `poll` hands out queued jobs; `claim` is a compare-and-swap on the job, and the key must match the job row. Only one run can own a job; a worker that loses the race drops it at once. Re-checks the month cap and starts the heartbeat.
 2. **fetch**: a fresh Telnyx link via the bridge, downloaded at once and never stored.
    - Probe: 2 channels, ≤60 min, length within ±5% of `calls.duration` (a miss is a QA flag).
    - Over 60 min fails as `bad_audio: too_long`.
-3. **ASR pass 1**: AssemblyAI with a pinned model, `multichannel`, entity detection and word timestamps. The webhook only wakes the run; the status is always read back with our key.
+3. **ASR pass 1**: AssemblyAI with a pinned model, `multichannel`, entity detection and word timestamps. The worker polls the status with its own key (no inbound webhook).
 4. **detect** (SPEC §2.3), three sources:
    - **Rules:** digit runs ≥4 within 8 s across speakers; spoken digits and letters; MBI; spelled-out runs; emails; addresses; dates; ages; TR's agent and caller names; `extra_terms`.
    - **AssemblyAI entities.**
@@ -60,8 +60,8 @@ Every JSON result is an envelope `{schema, schema_version: "1.0", pipeline_versi
 | Smart clips + coaching (§2.6–2.7) | `lib/labels.ts`, step `clipsAndCoaching`; tests in `test/pipeline.test.ts` |
 | Second pass on clips + coaching (§2.8) | `lib/qa.ts` `clipReasons`, `textPiiReasons`; step `verifySecondPass` |
 | Test fixtures (§7) | **The set:** 12 synthetic dual-channel calls in `fixtures/calls`, with planted fictional PII. They include crosstalk, spoken dashes, bank and card numbers, health details, objections, a 47-min call, a numbers-not-PII control and long numbers spoken as words. **Rule tests:** `npm test`. **Real vendors:** `npm run eval` checks for 0 leaks and that labels are stable across 3 reruns. |
-| Logs with no PII | `lib/log.ts` (ids and numbers only). Step I/O carries no text: transcripts, clips and coaching live in the private bucket between steps. Errors keep only a code. |
-| Delete removes every copy | **Order:** the admin `delete {call_id}` sets the **tombstone first**; then `/api/delete` cancels runs and waits for them to stop; then the AssemblyAI transcripts are deleted; then both buckets are purged. **Library rows** stay as the take-down record, `withdrawn` and emptied of audio paths and generated text. **Late re-purge:** a durable `purgeLater` run purges again after 2h15m. **Status:** the job becomes `deleted` only when the worker answered 200. A 207 means try again later. |
+| Logs with no PII | `lib/log.ts` (ids and numbers only). Nothing the worker holds between steps is text: transcripts, clips and coaching live in TR's private `sample-src/<job_id>/` between steps. Errors keep only a code. |
+| Delete removes every copy | **Order:** the admin `delete {call_id}` sets the **tombstone first**, fails a running job, purges both buckets, and withdraws the library rows (kept as the take-down record, emptied of audio paths and generated text). **No vendor copy and no live run:** the job is `deleted` at once. **Otherwise:** the worker running it stops on its next poll, deletes its AssemblyAI copies and reports `vendor_purged`; the bridge then purges again and marks it `deleted`. **A dead worker:** after its heartbeat goes stale, any worker's poll gets the leftover ids in its cleanup list. |
 
 ## Deliberate deviations from SPEC v0.2
 
@@ -83,19 +83,19 @@ Every JSON result is an envelope `{schema, schema_version: "1.0", pipeline_versi
 | B5 | SPEC copy + defaults | `truering/docs/recording-library/SPEC.md` = main's v0.2 byte for byte. Defaults: `pitch_shift_customer:false`; `clips {enabled, max_per_call 6, min_s 20, max_s 240}`; `coaching {enabled, rubric fe_v1}`. |
 | B6 | Bridge vs callback | Dmitry chose the bridge. TR_PLAN is updated (RL-2 = `training-library-admin`, RL-3 = bridge), and `schema_version` "1.0" is on envelopes and job rows. |
 | B7 | Patch based on ef56fd65 | Rebased on main. The migration version is new (the old `20261012230000` collided with `wl_m3_operator_telephony_flag`). Manifest is 2026-10-12.3. |
-| N1 | Replay cache on `/api/delete` | No cache: every effect is idempotent within the 300 s window, as documented in `app/api/delete/route.ts`. |
-| N2 | `/api/jobs` key vs job row | The key is required and the bridge `claim` compares it (`KEY_MISMATCH`). |
+| N1 | Replay cache on `/api/delete` | Moot since the pull model: the worker has no endpoints. |
+| N2 | `/api/jobs` key vs job row | The bridge `claim` compares the key (`KEY_MISMATCH`); since the pull model the key also comes from the bridge itself. |
 | N3 | 207 handling | The job becomes `deleted` only after a 200 from the worker; on a 207 the UI offers delete again. |
 | N4 | `isQuantity` | Limited to runs ≤4 digits or said as an amount; regression tests cover the 11-digit spoken account number and the amounts. |
 | N5 | MBI | Comment on the upper-case matching; the spoken-dash MBI is in a regression test and fixture 05. |
 | N6 | Cap alert + estimate | ops-alert key `sample_cost_cap`. The admin and worker estimates use one formula (`lib/cost.ts` = `training-library-admin` `estimateJobUsd`). |
-| N7 | ffmpeg binary ships | A `prebuild`/`pretest` gate (`scripts/check-ffmpeg.mjs`) fails the build if the binary is missing. Vercel runs install scripts. |
+| N7 | ffmpeg binary ships | `scripts/check-ffmpeg.mjs` runs as `postinstall` (so `npm ci` and the Docker build fail without the binary) and before tests; the worker's startup self-check runs it too. |
 
 Also fixed: calls RLS limits an AM to their own book, so the pick list is server-side (`pick`), because AM curation is global.
 
 ## After the review: repo split (2026-10-13)
 
-The worker is its own repo (this one) and its own Vercel project. TrueRing's branch `feat/sample-redaction` keeps only the TrueRing side; `truering/` here is a reference copy of that side (refreshed TrueRing → here with `refresh.sh`; never applied from here), and `check.sh` verifies a TrueRing checkout.
+The worker is its own repo (this one), deployed separately. TrueRing's branch `feat/sample-redaction` keeps only the TrueRing side; `truering/` here is a reference copy of that side (refreshed TrueRing → here with `refresh.sh`; never applied from here), and `check.sh` verifies a TrueRing checkout.
 The end-to-end simulation (`npm run simulate`) found one worker defect, now fixed: a job row whose `options` lacked `bleep_pad_ms` produced NaN bleep intervals, i.e. nothing bleeped (the second pass did flag it). `lib/options.ts` now fails every redaction setting safe, with tests in `test/options.test.ts`.
 
 ## Review of 4f7ad9a (2026-10-13), item by item
@@ -106,7 +106,19 @@ Decision: results come back by pull through `sample-redaction-bridge`, as built.
 |---|---|---|
 | 1 | SPEC.md: drop the signed callback, describe pull-through-bridge | SPEC is TrueRing's document, so it changed on TrueRing branch `feat/sample-redaction` and this repo's copy was refreshed. **Changed:** the start body (ids only); the bridge `job` / `sign` / `status` / `complete` / `fail` actions, with the actual `complete` payload; storage on TR's side only; takedown via `/api/delete`. **Removed:** the callback, `GET /jobs/:id`, the 7-day service copies and the n8n section. TR_PLAN's status line was updated to match. |
 | 2 | `truering/` is a reference copy only | `truering/README.md` and the root README say so first. `install.sh` (which applied it from here) is removed. `refresh.sh` copies one way, TrueRing → here, and `check.sh` only reads a TrueRing checkout. Applying happens only from `Mahamadou2004/truering`. |
-| 3 | Minimum Workflow log retention; ids, hashes and counts only | Every `start()` (the job run, and both `purgeLater` starts) passes `RUN_OPTIONS = { experimental_retention: 0 }`. The World deletes a run's inputs, outputs and event payloads as soon as it ends, keeping only ids, timestamps, status and step names. The simulation checks every run carries `$retention: "0"` and that finished runs keep no payloads. Still-sleeping `purgeLater` runs keep theirs (job ids) until they end. Step I/O stays ids, hashes, counts and offsets, checked by the simulation's decoded event-log scan. |
-| 4 | ffmpeg ships in the Vercel build | **Verified on Vercel:** the build log shows `ffmpeg-static ok: /vercel/path0/node_modules/ffmpeg-static/ffmpeg`. On the preview, `GET /api/health` (served by the same function bundle as `/api/jobs` and `/api/delete`) reported `ffmpeg: { ok, version 7.0.2-static, linux-x64, 79.8 MB }` and `rubberband: true`. **Per function:** a `vercel build` shows every function traces `node_modules/ffmpeg-static/ffmpeg`, including the workflow's `flow.func`. **Health:** now answers 503 when the binary is missing. **package.json:** gets `allowScripts` for `ffmpeg-static@5.3.0`, because Vercel's npm 11 warned that its install script wasn't approved (it still ran), and `engines.node` is pinned to `22.x`, because `>=22` had built on Node 24. |
-| 5 | Stale "sample-work bucket" comment | `workflows/steps.ts` now says TR's `sample-src/<job_id>/` scratch prefix. |
+| 3 | (superseded: no Vercel, no Workflow log; see below) Minimum Workflow log retention; ids, hashes and counts only | Every `start()` (the job run, and both `purgeLater` starts) passes `RUN_OPTIONS = { experimental_retention: 0 }`. The World deletes a run's inputs, outputs and event payloads as soon as it ends, keeping only ids, timestamps, status and step names. The simulation checks every run carries `$retention: "0"` and that finished runs keep no payloads. Still-sleeping `purgeLater` runs keep theirs (job ids) until they end. Step I/O stays ids, hashes, counts and offsets, checked by the simulation's decoded event-log scan. |
+| 4 | (superseded: Docker image; see below) ffmpeg ships in the Vercel build | **Verified on Vercel:** the build log shows `ffmpeg-static ok: /vercel/path0/node_modules/ffmpeg-static/ffmpeg`. On the preview, `GET /api/health` (served by the same function bundle as `/api/jobs` and `/api/delete`) reported `ffmpeg: { ok, version 7.0.2-static, linux-x64, 79.8 MB }` and `rubberband: true`. **Per function:** a `vercel build` shows every function traces `node_modules/ffmpeg-static/ffmpeg`, including the workflow's `flow.func`. **Health:** now answers 503 when the binary is missing. **package.json:** gets `allowScripts` for `ffmpeg-static@5.3.0`, because Vercel's npm 11 warned that its install script wasn't approved (it still ran), and `engines.node` is pinned to `22.x`, because `>=22` had built on Node 24. |
+| 5 | Stale "sample-work bucket" comment | `lib/steps.ts` (was `workflows/steps.ts`) now says TR's `sample-src/<job_id>/` scratch prefix. |
 | Rule | Input/output only | Unchanged and still met: no database, tables, buckets or Supabase key in the worker. |
+
+## 2026-10-13: plain Node worker, pull model (Vercel and the Workflow SDK removed)
+
+Asked by Dmitry: "I was envisioning the service as just a node background worker".
+- **Runtime.** `src/worker.ts` is one long-running process. `lib/job.ts` runs a job start to finish, and `lib/retry.ts` retries steps with the old rule (anything but `FatalError`, up to 4 tries).
+- **Waiting on AssemblyAI.** The worker polls AssemblyAI's status with its own key, so there's no webhook. Detection, DSP, clips, coaching and QA in `lib/` are unchanged.
+- **Gone:** the Next.js routes `/api/jobs`, `/api/delete` and `/api/health`, the `purgeLater` timer runs, the Workflow event log and its retention setting, `vercel.json` and the Vercel project.
+- **Connection.** The worker calls the bridge's new `poll` action every 20 s. It holds no URL TrueRing calls, and needs one secret (`SAMPLE_REDACTOR_BRIDGE_SECRET`); `SAMPLE_REDACTOR_URL` and `SAMPLE_REDACTOR_START_SECRET` are gone.
+- **Liveness.** `heartbeat_at`, a new column in the staged migration, guarded like the other worker columns, is refreshed by every poll. A running job whose heartbeat is older than `SAMPLE_WORKER_STALE_S` (300) is failed by the bridge, with its files purged. Its vendor ids go to the next poll's cleanup list. A job's own run reports `vendor_purged` last, which ends its heartbeat and completes a takedown.
+- **Why no late re-purge any more.** The Workflow design re-purged 2h15m later because a retried step elsewhere could still upload. Here a job's steps run in one process and every upload is awaited, so when a run returns nothing of it is in flight. The bridge also purges again when it marks a takedown `deleted`.
+- **Restarts.** SIGTERM aborts running jobs, which fail as `internal: worker restarted` (the AM retries) and report their vendor copies before the process exits. SIGKILL is covered by the stale-heartbeat path.
+- **Proof** (`npm run simulate`, 96 checks): two workers racing, a takedown mid-run, a worker killed mid-run (the bridge fails it, the other worker cleans up, retry finishes it), and SIGTERM. A production-only install (`npm ci --omit=dev`, the Dockerfile's steps) passes the self-check. The Docker image itself was not built here, because Docker Desktop was waiting on a prompt.

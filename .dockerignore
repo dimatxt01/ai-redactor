@@ -1,0 +1,12 @@
+node_modules
+fixtures
+sim
+sim-out
+truering
+test
+docs
+.git
+.env*
+.vercel
+.next
+.swc

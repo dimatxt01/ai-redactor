@@ -2,12 +2,8 @@ node_modules/
 .DS_Store
 .env*
 !.env.example
-.next/
 .vercel/
 fixtures/out/
-next-env.d.ts
 *.tsbuildinfo
 .swc/
-.workflow-data/
-app/.well-known/workflow/
 sim-out/

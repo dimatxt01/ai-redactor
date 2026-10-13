@@ -23,6 +23,7 @@ ALTER TABLE public.sample_redaction_jobs
   DROP COLUMN IF EXISTS delete_requested_at,
   DROP COLUMN IF EXISTS completed_at,
   DROP COLUMN IF EXISTS started_at,
+  DROP COLUMN IF EXISTS heartbeat_at,
   DROP COLUMN IF EXISTS workflow_run_id,
   DROP COLUMN IF EXISTS asr_transcript_ids,
   DROP COLUMN IF EXISTS pipeline_version,

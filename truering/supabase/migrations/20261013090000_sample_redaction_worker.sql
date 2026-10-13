@@ -4,8 +4,9 @@
 --
 -- What it adds (RL-1 objects are extended, never re-created or dropped)
 --   sample_redaction_jobs     + columns the worker and the caps need: version, options, call_meta, error_detail, cost_usd,
---                               reserved_usd, pipeline_version, asr_transcript_ids, workflow_run_id, started/completed_at,
---                               delete_requested_at (tombstone), deleted_at; unique (call_id, version); key = call:<id>:v<version>;
+--                               reserved_usd, pipeline_version, asr_transcript_ids, workflow_run_id (the worker run that owns
+--                               the job), heartbeat_at (that run is alive), started/completed_at, delete_requested_at (tombstone),
+--                               deleted_at; unique (call_id, version); key = call:<id>:v<version>;
 --                               error_code limited to the spec's codes.
 --   trigger sample_redaction_jobs_service_columns  browser roles (RL-1 lets staff write jobs) cannot set or change the
 --                               budget, run-ownership, vendor-id or takedown columns; only service_role (edge functions) can.
@@ -60,7 +61,8 @@ ALTER TABLE public.sample_redaction_jobs
   ADD COLUMN reserved_usd        numeric(10,4) NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0),
   ADD COLUMN pipeline_version    text,
   ADD COLUMN asr_transcript_ids  text[] NOT NULL DEFAULT '{}'::text[],  -- AssemblyAI ids, so delete can purge the vendor copy
-  ADD COLUMN workflow_run_id     text,
+  ADD COLUMN workflow_run_id     text,          -- the worker run that claimed the job (name kept from the Workflow design)
+  ADD COLUMN heartbeat_at        timestamptz,   -- the owning run's last bridge poll; stale = the worker died (bridge fails the job)
   ADD COLUMN started_at          timestamptz,
   ADD COLUMN completed_at        timestamptz,
   ADD COLUMN delete_requested_at timestamptz,   -- tombstone, set FIRST by delete; submit/retry/bridge refuse the call after it
@@ -81,13 +83,14 @@ LANGUAGE plpgsql SET search_path = public, pg_temp AS $fn$
 BEGIN
   IF current_user NOT IN ('anon', 'authenticated') THEN RETURN NEW; END IF;
   IF TG_OP = 'INSERT' THEN
-    IF NEW.cost_usd <> 0 OR NEW.reserved_usd <> 0 OR NEW.workflow_run_id IS NOT NULL OR NEW.asr_transcript_ids <> '{}'
+    IF NEW.cost_usd <> 0 OR NEW.reserved_usd <> 0 OR NEW.workflow_run_id IS NOT NULL OR NEW.heartbeat_at IS NOT NULL OR NEW.asr_transcript_ids <> '{}'
        OR NEW.delete_requested_at IS NOT NULL OR NEW.deleted_at IS NOT NULL OR NEW.started_at IS NOT NULL
        OR NEW.completed_at IS NOT NULL OR NEW.pipeline_version IS NOT NULL THEN
       RAISE EXCEPTION 'sample_redaction_jobs worker columns are set by the edge functions only' USING ERRCODE = 'insufficient_privilege';
     END IF;
   ELSIF NEW.cost_usd IS DISTINCT FROM OLD.cost_usd OR NEW.reserved_usd IS DISTINCT FROM OLD.reserved_usd
-     OR NEW.workflow_run_id IS DISTINCT FROM OLD.workflow_run_id OR NEW.asr_transcript_ids IS DISTINCT FROM OLD.asr_transcript_ids
+     OR NEW.workflow_run_id IS DISTINCT FROM OLD.workflow_run_id OR NEW.heartbeat_at IS DISTINCT FROM OLD.heartbeat_at
+     OR NEW.asr_transcript_ids IS DISTINCT FROM OLD.asr_transcript_ids
      OR NEW.delete_requested_at IS DISTINCT FROM OLD.delete_requested_at OR NEW.deleted_at IS DISTINCT FROM OLD.deleted_at
      OR NEW.version IS DISTINCT FROM OLD.version OR NEW.call_id IS DISTINCT FROM OLD.call_id
      OR NEW.started_at IS DISTINCT FROM OLD.started_at OR NEW.completed_at IS DISTINCT FROM OLD.completed_at
@@ -164,7 +167,7 @@ BEGIN
   UPDATE public.sample_redaction_jobs SET
     status = 'queued', error_code = NULL, error_detail = NULL, qa_flag = false, qa_reasons = '[]'::jsonb,
     metrics = jsonb_build_object('cost_items', coalesce(metrics -> 'cost_items', '{}'::jsonb)),
-    reserved_usd = cost_usd + p_reserved, started_at = NULL, completed_at = NULL, workflow_run_id = NULL, created_at = now()
+    reserved_usd = cost_usd + p_reserved, started_at = NULL, completed_at = NULL, workflow_run_id = NULL, heartbeat_at = NULL, created_at = now()
   WHERE id = p_job_id;
   RETURN jsonb_build_object('ok', true, 'job_id', v_job.id, 'idempotency_key', v_job.idempotency_key);
 END

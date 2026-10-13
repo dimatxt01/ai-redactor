@@ -1,21 +1,20 @@
 // `npm run simulate` — the whole system on this machine, the way it will run in production:
 //
-//   AM (this script) ─► training-library-admin ─► worker /api/jobs ─► Workflow run ─► sample-redaction-bridge ─► Postgres
-//        REAL TR edge function (Deno)             REAL worker (next start, local Workflow World)   REAL TR edge function   REAL migrations
+//   AM (this script) ─► training-library-admin ─► Postgres ◄── sample-redaction-bridge ◄── poll ── worker A, worker B
+//        REAL TR edge function (Deno)             REAL migrations   REAL TR edge function (Deno)   REAL workers (node src/worker.ts)
 //
+// TR never calls the worker: submit queues a job, the two workers race for it through the bridge (claim CAS).
 // Faked: only what lives outside both repos — Supabase's HTTP layer (fake-supabase.ts: same queries, on a throwaway
 // local Postgres with the RL-1 + worker migrations; storage on disk), Telnyx, AssemblyAI, OpenRouter (fakes.ts).
 // The fake transcriber LISTENS to the redacted audio for the verification pass, so a value the worker failed
 // to bleep stays audible and is caught exactly as it would be in production.
 //
-// Touches nothing live: no Supabase project, no Vercel, no vendor, no keys. Every value in the calls is fictional.
-//   npm run simulate                 # build the worker, run every scenario, write sim-out/<time>/report.md
-//   npm run simulate -- --no-build   # reuse .next from the last build
+// Touches nothing live: no Supabase project, no vendor, no keys. Every value in the calls is fictional.
+//   npm run simulate                 # run every scenario, write sim-out/<time>/report.md
 //   npm run simulate -- --keep       # leave the servers running at the end (Ctrl-C to stop)
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { zstdDecompressSync } from "node:zlib";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { signBody } from "../lib/signature";
@@ -25,7 +24,6 @@ import { BLEEPED, decodeStereo, Fakes, plantedWords, toneShare, wordsOf, type Ma
 const ROOT = path.resolve(import.meta.dirname, "..");
 const TR = path.join(ROOT, "truering");
 const args = process.argv.slice(2);
-const NO_BUILD = args.includes("--no-build");
 const KEEP = args.includes("--keep");
 const STAMP = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-");
 const OUT = path.join(ROOT, "sim-out", STAMP);
@@ -34,14 +32,15 @@ const STORAGE = path.join(OUT, "storage");
 mkdirSync(LOGS, { recursive: true });
 mkdirSync(STORAGE, { recursive: true });
 
-// the Next.js integration keeps the local Workflow World under .next/; cleared per run, copied to OUT at the end
-const WF_DATA = path.join(ROOT, ".next", "workflow-data");
-const PORT = { pg: 5491, bridge: 3231, admin: 3232, fakes: 3233, worker: 3234 };
+const PORT = { pg: 5491, bridge: 3231, admin: 3232, fakes: 3233 };
+const STALE_S = 6;   // the bridge's "worker stopped responding" window (production: 300 s), short so the crash scenario is quick
 const BASE = (p: number) => `http://127.0.0.1:${p}`;
-const SECRET = { bridge: `sim-bridge-${randomBytes(16).toString("hex")}`, start: `sim-start-${randomBytes(16).toString("hex")}`, sign: randomBytes(32).toString("hex") };
+const SECRET = { bridge: `sim-bridge-${randomBytes(16).toString("hex")}`, sign: randomBytes(32).toString("hex") };
 const AM = "22222222-0000-0000-0000-0000000000a3";      // account_manager in the RL-1 fixture
 const ADMIN = "22222222-0000-0000-0000-0000000000ad";   // admin in the RL-1 fixture
 const CALLS = ["01-classic-sale", "07-bank-and-card", "09-objections"] as const;
+// extra TR calls reusing a test call's recording: a takedown mid-run, and a worker crash mid-run
+const EXTRA = [{ key: "takedown", fixture: "09-objections" }, { key: "crash", fixture: "01-classic-sale" }] as const;
 
 // ── tiny report ──────────────────────────────────────────────────────────────
 type Row = { section: string; ok: boolean; name: string; detail: string };
@@ -74,7 +73,7 @@ process.on("SIGINT", () => { stopAll(); process.exit(130); });
 async function waitFor(what: string, url: string, ms = 90_000) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
-    try { const r = await fetch(url, { method: url.endsWith("/api/health") ? "GET" : "POST", body: url.endsWith("/api/health") ? undefined : "{}" }); if (r.status < 500 || r.status === 501) return; } catch { /* not up */ }
+    try { const r = await fetch(url, { method: "POST", body: "{}" }); if (r.status < 500) return; } catch { /* not up */ }
     await sleep(500);
   }
   throw new Error(`${what} did not come up (${url}); see ${path.relative(ROOT, LOGS)}/`);
@@ -111,11 +110,14 @@ async function asStaff(user: string, body: Record<string, unknown>) {
   const r = await fetch(BASE(PORT.admin), { method: "POST", headers: { authorization: `Bearer sim:${user}`, "content-type": "application/json" }, body: JSON.stringify(body) });
   return { status: r.status, body: (await r.json().catch(() => ({}))) as any };
 }
-async function toWorker(p: string, payload: unknown, secret = SECRET.start) {
-  const raw = JSON.stringify(payload);
-  const r = await fetch(BASE(PORT.worker) + p, { method: "POST", headers: { "content-type": "application/json", "x-tr-signature": signBody(secret, raw) }, body: raw });
-  return { status: r.status, body: (await r.json().catch(() => ({}))) as any };
+const logOf = (name: string) => { try { return readFileSync(path.join(LOGS, `${name}.log`), "utf8"); } catch { return ""; } };
+async function waitLog(name: string, needle: string, ms = 60_000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { if (logOf(name).includes(needle)) return true; await sleep(250); }
+  return false;
 }
+/** which worker process owns this job: the one whose run won the bridge's claim (both may try) */
+const ownerOf = (job: string) => ["worker-a", "worker-b"].find((w) => logOf(w).includes(`"event":"job_claimed","job_id":"${job}"`));
 async function waitJob(id: string, until: (s: string) => boolean, ms = 240_000) {
   const seen: string[] = [];
   const end = Date.now() + ms;
@@ -164,27 +166,6 @@ function audibleValues(file: string, m: Manifest, fromMs = 0, toMs = Infinity): 
   return out;
 }
 // TERM (the carrier name) is configuration the AM types in on submit; it is stored on the job by design
-/** Workflow World files: step inputs/outputs are base64 `devl…` (devalue JSON) or `zstd…` (compressed devl). */
-function workflowText(raw: string): string {
-  const out: string[] = [];
-  const bytes = (b: Buffer): void => {
-    const head = b.subarray(0, 4).toString("latin1");
-    if (head === "zstd") return bytes(zstdDecompressSync(b.subarray(4)));
-    if (head === "devl") return walk(JSON.parse(b.subarray(4).toString("utf8")));
-    out.push(b.toString("utf8"));
-  };
-  const walk = (v: unknown): void => {
-    if (typeof v === "string") out.push(v);
-    else if (Array.isArray(v)) v.forEach(walk);
-    else if (v && typeof v === "object") {
-      const o = v as Record<string, unknown>;
-      if (o.__type === "Uint8Array" && typeof o.data === "string") return bytes(Buffer.from(o.data, "base64"));
-      Object.values(o).forEach(walk);
-    }
-  };
-  try { walk(JSON.parse(raw)); } catch { out.push(raw); }
-  return norm(out.join(" "));
-}
 const PLANTED_TEXTS = (ms: Manifest[]) => [...new Set(ms.flatMap((m) => m.planted.filter((p) => p.kind !== "TERM").map((p) => norm(p.text)).filter((v) => v.length >= 4)))];
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -201,11 +182,6 @@ async function main() {
   const M = Object.fromEntries(CALLS.map((c) => [c, JSON.parse(readFileSync(path.join(fixtures, `${c}.planted.json`), "utf8")) as Manifest])) as Record<(typeof CALLS)[number], Manifest>;
   check("test calls ready", true, CALLS.map((c) => `${c} (${Math.round(M[c].total_ms / 1000)} s, ${M[c].planted.length} planted values)`).join(", "));
 
-  if (!NO_BUILD || !existsSync(path.join(ROOT, ".next", "BUILD_ID"))) {
-    execFileSync("npx", ["next", "build"], { cwd: ROOT, stdio: ["ignore", openSync(path.join(LOGS, "build.log"), "a"), openSync(path.join(LOGS, "build.log"), "a")] });
-  }
-  check("worker built (next build)", existsSync(path.join(ROOT, ".next", "BUILD_ID")));
-  rmSync(WF_DATA, { recursive: true, force: true });   // no runs left over from an earlier simulation
 
   // Postgres with the real migrations
   execFileSync(path.join(PGBIN, "initdb"), ["-D", PGDIR, "-U", "postgres", "-A", "trust"], { stdio: "ignore" });
@@ -236,6 +212,13 @@ async function main() {
                 ${lit(`https://s3.amazonaws.com/telephony-recorder-prod/${recId[c]}-1700000000.mp3`)}, ${lit(M[c].caller)}, '+15125550100');`);
     fakes.addRecording(recId[c], path.join(fixtures, `${c}.mp3`), M[c]);
   }
+  for (const x of EXTRA) {
+    callId[x.key] = randomUUID(); recId[x.key] = randomUUID();
+    psql(`insert into calls (id, agent_id, duration, disposition_id, recording_url, caller_name, caller_number)
+        values (${lit(callId[x.key])}, ${lit(agentId[x.fixture])}, ${Math.max(60, Math.round(M[x.fixture].total_ms / 1000))}, (select id from call_dispositions where name = 'Sale'),
+                ${lit(`https://s3.amazonaws.com/telephony-recorder-prod/${recId[x.key]}-1700000001.mp3`)}, ${lit(M[x.fixture].caller)}, '+15125550100');`);
+    fakes.addRecording(recId[x.key], path.join(fixtures, `${x.fixture}.mp3`), M[x.fixture]);
+  }
   // out-of-scope rows: a Twilio-era call, an agent without consent
   const twilioCall = randomUUID(), noConsentCall = randomUUID(), noConsentAgent = randomUUID();
   psql(`insert into agents (id, full_name) values (${lit(noConsentAgent)}, 'Pat Nobody');
@@ -253,26 +236,33 @@ async function main() {
     SIM_TELNYX_BASE: `${BASE(PORT.fakes)}/telnyx`, TELNYX_API_KEY: "sim-telnyx",
     SAMPLE_JOB_CAP_USD: "2", SAMPLE_MONTH_CAP_USD: "100", SAMPLE_ASR_USD_PER_HOUR: "0.45",
   };
-  startProc("bridge", "npx", [...deno, "sample-redaction-bridge", String(PORT.bridge)], { ...fnEnv, SAMPLE_REDACTOR_BRIDGE_SECRET: SECRET.bridge });
-  startProc("admin", "npx", [...deno, "training-library-admin", String(PORT.admin)], { ...fnEnv, SAMPLE_REDACTOR_URL: BASE(PORT.worker), SAMPLE_REDACTOR_START_SECRET: SECRET.start });
-  startProc("worker", process.execPath, [path.join(ROOT, "node_modules/next/dist/bin/next"), "start", "-p", String(PORT.worker), "-H", "127.0.0.1"], {
-    NODE_OPTIONS: `--import ${path.join(ROOT, "sim/vendor-redirect.mjs")}`, SIM_VENDOR_BASE: BASE(PORT.fakes),
-    PORT: String(PORT.worker), WORKFLOW_LOCAL_BASE_URL: BASE(PORT.worker), WORKFLOW_LOCAL_RECOVER_ACTIVE_RUNS: "0",
-    TR_BRIDGE_URL: BASE(PORT.bridge), SAMPLE_REDACTOR_BRIDGE_SECRET: SECRET.bridge, SAMPLE_REDACTOR_START_SECRET: SECRET.start,
-    ASSEMBLYAI_API_KEY: "sim-assemblyai", OPENROUTER_API_KEY: "sim-openrouter",
-  });
+  startProc("bridge", "npx", [...deno, "sample-redaction-bridge", String(PORT.bridge)], { ...fnEnv, SAMPLE_REDACTOR_BRIDGE_SECRET: SECRET.bridge, SAMPLE_WORKER_STALE_S: String(STALE_S) });
+  startProc("admin", "npx", [...deno, "training-library-admin", String(PORT.admin)], { ...fnEnv, SAMPLE_WORKER_STALE_S: String(STALE_S) });
   await waitFor("bridge (Deno)", BASE(PORT.bridge));
   await waitFor("training-library-admin (Deno)", BASE(PORT.admin));
-  await waitFor("worker (next start)", `${BASE(PORT.worker)}/api/health`);
-  const health = await (await fetch(`${BASE(PORT.worker)}/api/health`)).json();
-  check("services up: bridge + training-library-admin (real code, Deno) · worker (next start)",
-    health.ok && health.configured.bridge && health.configured.start_secret, `worker ${health.pipeline_version}, models ${JSON.stringify(health.models)}`);
+  // two worker processes, as during a deploy rollover: they race for every job
+  const workerEnv = (name: string, secret = SECRET.bridge) => {
+    const tmp = path.join(OUT, `tmp-${name}`);
+    mkdirSync(tmp, { recursive: true });
+    return {
+      NODE_OPTIONS: `--import ${path.join(ROOT, "sim/vendor-redirect.mjs")}`, SIM_VENDOR_BASE: BASE(PORT.fakes),
+      TR_BRIDGE_URL: BASE(PORT.bridge), SAMPLE_REDACTOR_BRIDGE_SECRET: secret,
+      ASSEMBLYAI_API_KEY: "sim-assemblyai", OPENROUTER_API_KEY: "sim-openrouter",
+      POLL_S: "2", ASR_POLL_S: "1", WORKER_CONCURRENCY: "2", TMPDIR: tmp, ALIVE_FILE: path.join(OUT, `alive-${name}`),
+    };
+  };
+  const startWorker = (name: string, secret?: string) => startProc(name, process.execPath, ["--import", "tsx", path.join(ROOT, "src/worker.ts")], workerEnv(name, secret));
+  const workers: Record<string, ChildProcess> = { "worker-a": startWorker("worker-a"), "worker-b": startWorker("worker-b") };
+  const up = (await waitLog("worker-a", '"event":"worker_up"')) && (await waitLog("worker-b", '"event":"worker_up"'));
+  check("services up: bridge + training-library-admin (real code, Deno) · 2 workers (node src/worker.ts)", up,
+    up ? `${/"ffmpeg":"([^"]*)"/.exec(logOf("worker-a"))?.[1] ?? "?"} · ${/"pipeline":"([^"]*)"/.exec(logOf("worker-a"))?.[1] ?? "?"} · no port opened` : "a worker did not start; see logs");
 
-  // ── 1. connection + auth ──
-  sectionStart("1. connection and auth (TR ↔ worker, both directions)");
+  // ── 1. connection + auth ──  // ── 1. connection + auth ──
+  sectionStart("1. connection and auth (worker → bridge is the only connection)");
   {
-    const bad = await toWorker("/api/jobs", { job_id: randomUUID(), idempotency_key: `call:${randomUUID()}:v1` }, "wrong-secret");
-    check("worker refuses a start signed with the wrong secret", bad.status === 401, `HTTP ${bad.status}`);
+    const wrong = startWorker("worker-wrong-secret", "not-the-bridge-secret");
+    const exit = await new Promise<number | null>((r) => { wrong.on("exit", (c) => r(c)); setTimeout(() => r(-1), 30_000); });
+    check("a worker with the wrong bridge secret refuses to start", exit === 1 && logOf("worker-wrong-secret").includes('"event":"worker_refused_to_start"'), `exit ${exit}`);
     const raw = JSON.stringify({ action: "job", job_id: randomUUID() });
     const r = await fetch(BASE(PORT.bridge), { method: "POST", headers: { "x-tr-signature": signBody("wrong", raw) }, body: raw });
     check("bridge refuses a worker call signed with the wrong secret", r.status === 401, `HTTP ${r.status}`);
@@ -292,7 +282,7 @@ async function main() {
     psql(`update feature_flags set enabled = true where key = 'recording_library'`);
     const pick = await asStaff(AM, { action: "pick", min_s: 60, max_s: 3600 });
     const ours = (pick.body.rows ?? []).filter((r: any) => Object.values(callId).includes(r.id));
-    check("pick lists the Sale calls with a Telnyx recording, agent name and consent", ours.length === CALLS.length && ours.every((r: any) => r.consent && r.agent_name),
+    check("pick lists the Sale calls with a Telnyx recording, agent name and consent", ours.length === Object.keys(callId).length && ours.every((r: any) => r.consent && r.agent_name),
       `${pick.body.rows?.length ?? 0} rows; Twilio call listed: ${(pick.body.rows ?? []).some((r: any) => r.id === twilioCall)}`);
     const tw = await asStaff(AM, { action: "submit", call_id: twilioCall, options: opts });
     check("Twilio-era recording → refused", tw.status === 422 && tw.body.error_code === "OUT_OF_SCOPE", `${tw.status} ${tw.body.error_code}`);
@@ -311,37 +301,28 @@ async function main() {
   // ── 3. the happy path ──
   sectionStart(`3. ${c1}: AM submits → worker redacts → library draft`);
   const sub = await asStaff(AM, { action: "submit", call_id: callId[c1], options: opts });
-  check("submit accepted; worker run started", sub.status === 200 && !!sub.body.run_id, `${sub.status} job ${sub.body.job_id ?? "-"} key ${sub.body.idempotency_key ?? "-"} reserved $${sub.body.reserved_usd ?? "-"}`);
+  check("submit accepted and queued (TR does not call the worker)", sub.status === 200 && sub.body.status === "queued", `${sub.status} job ${sub.body.job_id ?? "-"} key ${sub.body.idempotency_key ?? "-"} reserved $${sub.body.reserved_usd ?? "-"}`);
   const job1 = String(sub.body.job_id);
   const again = await asStaff(AM, { action: "submit", call_id: callId[c1], options: opts });
   check("submitting the same call again does nothing twice", again.status === 200 && again.body.existing === true && again.body.job_id === job1, `${again.status} existing=${again.body.existing}`);
   const w1 = await waitJob(job1, (s) => s === "done" || s === "failed");
-  check("job reached done", w1.status === "done", `stages seen: ${w1.seen.join(" → ")}${w1.error_code ? ` (${w1.error_code})` : ""}${w1.timedOut ? " TIMED OUT" : ""}`);
+  check("a worker picked it up from its poll; job reached done", w1.status === "done", `by ${ownerOf(job1) ?? "?"}; stages seen: ${w1.seen.join(" → ")}${w1.error_code ? ` (${w1.error_code})` : ""}${w1.timedOut ? " TIMED OUT" : ""}`);
   await verifyDone(job1, M[c1], fakes);
 
   // ── 4. duplicates and a forged pairing ──
-  sectionStart(`4. ${c9}: wrong key, then the same start delivered twice (job row with sparse options: worker defaults)`);
+  sectionStart(`4. ${c9}: both workers race for one job (job row with sparse options: worker defaults)`);
   const ins = JSON.parse(psql(`set role service_role; select public.sample_job_insert(${lit(callId[c9])}, 1, ${lit(JSON.stringify({ customer_channel: M[c9].customer_channel }))}::jsonb,
       ${lit(JSON.stringify({ duration_s: Math.round(M[c9].total_ms / 1000), vertical: "final_expense", channel_map: { customer: M[c9].customer_channel, agent: 1 - M[c9].customer_channel, verified: false } }))}::jsonb, ${lit(AM)}, 0.3, 100)`).split("\n").pop()!);
   const job9 = String(ins.job_id);
   {
-    const wrong = await toWorker("/api/jobs", { job_id: job9, idempotency_key: `call:${callId[c1]}:v1` });
-    await sleep(4000);
-    const j = q1(`select status, workflow_run_id from sample_redaction_jobs where id = ${lit(job9)}`);
-    check("signed start pairing this job with another call's key → job untouched", wrong.status === 202 && j.status === "queued" && !j.workflow_run_id,
-      `worker ${wrong.status}; job still ${j.status}, owner ${j.workflow_run_id ?? "none"}`);
-    const [a, b] = await Promise.all([
-      toWorker("/api/jobs", { job_id: job9, idempotency_key: ins.idempotency_key }),
-      toWorker("/api/jobs", { job_id: job9, idempotency_key: ins.idempotency_key }),
-    ]);
-    check("the same start delivered twice → two runs started", a.status === 202 && b.status === 202 && a.body.run_id !== b.body.run_id, `${a.body.run_id} / ${b.body.run_id}`);
     const w9 = await waitJob(job9, (s) => s === "done" || s === "failed");
     check("job reached done", w9.status === "done", `stages seen: ${w9.seen.join(" → ")}${w9.error_code ? ` (${w9.error_code})` : ""}`);
-    const owner = q1(`select workflow_run_id from sample_redaction_jobs where id = ${lit(job9)}`).workflow_run_id;
     const asr = [...fakes.transcripts.values()].filter((t) => t.job === job9);
-    check("exactly one run did the work (one owner, 2 transcriptions, 1 library row)",
-      [a.body.run_id, b.body.run_id].includes(owner) && asr.length === 2 && q1(`select count(*)::int n from training_library_calls where job_id = ${lit(job9)}`).n === 1,
-      `owner ${owner}; AssemblyAI jobs ${asr.length}`);
+    const starts = ["worker-a", "worker-b"].filter((w) => logOf(w).includes(`"event":"job_started","job_id":"${job9}"`));
+    const lostClaim = ["worker-a", "worker-b"].filter((w) => logOf(w).includes(`"event":"job_ended","job_id":"${job9}"`) && /"status":"duplicate"/.test(logOf(w).split("\n").find((l) => l.includes(`"job_ended","job_id":"${job9}"`)) ?? ""));
+    check("exactly one run did the work (2 transcriptions, 1 library row)",
+      asr.length === 2 && q1(`select count(*)::int n from training_library_calls where job_id = ${lit(job9)}`).n === 1,
+      `started by ${starts.join(" + ") || "?"}${lostClaim.length ? `; ${lostClaim.join(" + ")} lost the claim and stopped` : ""}; AssemblyAI jobs ${asr.length}`);
     await verifyDone(job9, M[c9], fakes);
   }
 
@@ -357,7 +338,7 @@ async function main() {
     !filesUnder("sample-src", job7).length && !filesUnder("training-library", job7).length && ![...fakes.transcripts.values()].some((t) => t.job === job7));
   fakes.telnyx.expired.delete(recId[c7]);
   const retry = await asStaff(AM, { action: "retry", job_id: job7 });
-  check("AM retry accepted (same key, restarted)", retry.status === 200, `${retry.status} ${JSON.stringify(retry.body).slice(0, 120)}`);
+  check("AM retry accepted (same key, queued again)", retry.status === 200 && retry.body.status === "queued", `${retry.status} ${JSON.stringify(retry.body).slice(0, 120)}`);
   const w7b = await waitJob(job7, (s) => s === "done" || s === "failed");
   check("retried job reached done", w7b.status === "done", `stages seen: ${w7b.seen.join(" → ")}${w7b.error_code ? ` (${w7b.error_code})` : ""}`);
   await verifyDone(job7, M[c7], fakes);
@@ -390,7 +371,7 @@ async function main() {
   {
     const del = await asStaff(ADMIN, { action: "delete", call_id: callId[c1] });
     const j = q1(`select status, deleted_at, delete_requested_at from sample_redaction_jobs where id = ${lit(job1)}`);
-    check("delete → 200 and the job is 'deleted' (worker confirmed)", del.status === 200 && j.status === "deleted" && !!j.deleted_at, `${del.status} ${del.body.error_code ?? ""} job ${j.status}`);
+    check("delete → 200 and the job is 'deleted' at once (finished job: no vendor copy left, no live run)", del.status === 200 && del.body.pending_worker === 0 && j.status === "deleted" && !!j.deleted_at, `${del.status} ${del.body.error_code ?? ""} job ${j.status}, pending_worker ${del.body.pending_worker}`);
     check("TR copies gone (both buckets)", !filesUnder("sample-src", job1).length && !filesUnder("training-library", job1).length,
       `left: ${[...filesUnder("sample-src", job1), ...filesUnder("training-library", job1)].join(", ") || "none"}`);
     const l = q1(`select status, audio_path, coaching::text c from training_library_calls where job_id = ${lit(job1)}`);
@@ -405,34 +386,69 @@ async function main() {
     check("bridge refuses the worker on a deleted job", br.status === 409, `HTTP ${br.status}`);
   }
 
-  // ── 8. privacy ──
-  sectionStart("8. privacy: where personal data could end up");
+  // ── 8. takedown while a worker is running the job ──
+  sectionStart("8. takedown while a worker is mid-job");
+  {
+    fakes.holdAsr = true;
+    const s8 = await asStaff(AM, { action: "submit", call_id: callId.takedown, options: { ...opts, customer_channel: M[c9].customer_channel } });
+    const job = String(s8.body.job_id);
+    const mid = await waitJob(job, (st) => st === "transcribing", 60_000);
+    const vendor = () => [...fakes.transcripts.values()].filter((t) => t.job === job);
+    check("job is mid-run (transcribing; AssemblyAI has a copy)", mid.status === "transcribing" && vendor().length === 1, `${mid.seen.join(" → ")}; vendor copies ${vendor().length}`);
+    const del = await asStaff(ADMIN, { action: "delete", call_id: callId.takedown });
+    check("delete → 200, pending on the worker (it holds a live run)", del.status === 200 && del.body.pending_worker === 1, `${del.status} pending_worker ${del.body.pending_worker}`);
+    const end = await waitJob(job, (st) => st === "deleted", 30_000);
+    const owner = ownerOf(job);
+    check("the worker stopped the job on its next poll; the job is 'deleted' once it reported", end.status === "deleted" && !!owner && logOf(owner).includes(`"event":"job_stop_requested","job_id":"${job}"`),
+      `${end.seen.join(" → ")} (${owner ?? "?"})`);
+    check("its AssemblyAI copy is deleted; TR storage is empty", vendor().length > 0 && vendor().every((t) => fakes.deleted.has(t.id)) && !filesUnder("sample-src", job).length && !filesUnder("training-library", job).length,
+      `${vendor().filter((t) => fakes.deleted.has(t.id)).length}/${vendor().length} vendor copies deleted`);
+    fakes.holdAsr = false;
+  }
+
+  // ── 9. a worker dies mid-job ──
+  sectionStart("9. a worker is killed mid-job (no goodbye): the bridge fails it, the other worker cleans up, retry works");
+  {
+    fakes.holdAsr = true;
+    const s9 = await asStaff(AM, { action: "submit", call_id: callId.crash, options: opts });
+    const job = String(s9.body.job_id);
+    const mid = await waitJob(job, (st) => st === "transcribing", 60_000);
+    for (let i = 0; i < 40 && !ownerOf(job); i++) await sleep(250);
+    const owner = ownerOf(job)!;
+    const other = owner === "worker-a" ? "worker-b" : "worker-a";
+    workers[owner].kill("SIGKILL");
+    check("job mid-run, then its worker is killed (SIGKILL)", mid.status === "transcribing" && !!owner, `${owner} killed during ${mid.status}`);
+    fakes.holdAsr = false;
+    const failed = await waitJob(job, (st) => st === "failed", 60_000);
+    const row = q1(`select error_code, error_detail from sample_redaction_jobs where id = ${lit(job)}`);
+    check(`after ${STALE_S} s without a heartbeat the bridge fails it ("worker stopped responding")`, failed.status === "failed" && /worker stopped responding/.test(row.error_detail ?? ""), `${row.error_code}: ${row.error_detail}`);
+    const vendor = () => [...fakes.transcripts.values()].filter((t) => t.job === job);
+    for (let i = 0; i < 80 && !vendor().every((t) => fakes.deleted.has(t.id)); i++) await sleep(250);
+    const left = q1(`select coalesce(array_length(asr_transcript_ids, 1), 0) n from sample_redaction_jobs where id = ${lit(job)}`).n;
+    check(`${other} deletes the dead run's AssemblyAI copy from its poll's cleanup list`, vendor().length > 0 && vendor().every((t) => fakes.deleted.has(t.id)) && left === 0 && logOf(other).includes(`"event":"cleanup_done","job_id":"${job}"`),
+      `${vendor().filter((t) => fakes.deleted.has(t.id)).length}/${vendor().length} deleted; ids left on the row ${left}`);
+    check("TR storage left by the dead run is purged", !filesUnder("sample-src", job).length && !filesUnder("training-library", job).length);
+    const rt = await asStaff(AM, { action: "retry", job_id: job });
+    const done = await waitJob(job, (st) => st === "done" || st === "failed");
+    check("AM retry → the surviving worker finishes it", rt.status === 200 && done.status === "done" && ownerOf(job) !== undefined, `${done.seen.join(" → ")}`);
+    await verifyDone(job, M[c1], fakes);
+
+    // graceful stop: SIGTERM ends the process cleanly
+    const t0s = Date.now();
+    workers[other].kill("SIGTERM");
+    const code = await new Promise<number | null>((r) => { workers[other].on("exit", (c) => r(c)); setTimeout(() => r(-1), 40_000); });
+    check("SIGTERM: the worker stops polling and exits 0", code === 0 && logOf(other).includes('"event":"worker_stopped"'), `exit ${code} in ${Math.round((Date.now() - t0s) / 1000)} s`);
+  }
+
+  // ── 10. privacy ──
+  sectionStart("10. privacy: where personal data could end up");
   {
     const values = PLANTED_TEXTS(Object.values(M));
     const scan = (label: string, text: string) => { const hits = values.filter((v) => ` ${text} `.includes(` ${v} `)); return check(label, hits.length === 0, hits.length ? `found: ${hits.slice(0, 5).join(" | ")}` : `${values.length} planted values searched`); };
-    for (const n of ["worker", "bridge", "admin"]) scan(`${n} logs hold no planted value`, norm(readFileSync(path.join(LOGS, `${n}.log`), "utf8")));
-    const wfText: string[] = [];
-    const walk = (d: string) => { if (!existsSync(d)) return; for (const n of readdirSync(d)) { const f = path.join(d, n); if (statSync(f).isDirectory()) walk(f); else if (f.endsWith(".json")) wfText.push(workflowText(readFileSync(f, "utf8"))); } };
-    walk(WF_DATA);
-    const wfAll = wfText.join(" ");
-    // retention 0 (lib/config.ts RUN_OPTIONS): a finished run keeps ids, timestamps and status, but no payloads
-    const runsDir = path.join(WF_DATA, "runs");
-    const runs = existsSync(runsDir) ? readdirSync(runsDir).map((f) => JSON.parse(readFileSync(path.join(runsDir, f), "utf8"))) : [];
-    const payloadsOf = (runId: string) => {
-      let n = 0;
-      const count = (d: string) => { for (const x of readdirSync(d)) { const f = path.join(d, x); if (statSync(f).isDirectory()) count(f); else if (x.includes(runId)) n += (readFileSync(f, "utf8").match(/"__type":\s*"Uint8Array"/g) ?? []).length; } };
-      count(WF_DATA);
-      return n;
-    };
-    const finished = runs.filter((r) => ["completed", "failed", "cancelled"].includes(r.status));
-    const kept = finished.filter((r) => payloadsOf(r.runId) > 0);
-    check(`Workflow retention 0: every run asks for it, and the ${finished.length} finished runs keep no payloads`,
-      runs.length > 0 && runs.every((r) => r.attributes?.$retention === "0") && finished.length > 0 && kept.length === 0,
-      `${runs.length} runs; payloads left only on ${runs.length - finished.length} still-running (sleeping purgeLater) runs`);
-    // positive control: the decoder must see what IS in there (job ids), or "nothing found" proves nothing
-    check(`Workflow event log decoded (${wfText.length} files; job ids visible in the still-running runs)`, wfText.length > 0 && wfAll.includes(norm(job1)) && wfAll.includes(norm(job9)));
-    scan("Workflow event log holds no planted value (step inputs/outputs decoded)", wfAll);
-    cpSync(WF_DATA, path.join(OUT, "workflow-data"), { recursive: true });
+    for (const n of ["worker-a", "worker-b", "bridge", "admin"]) scan(`${n} logs hold no planted value`, norm(logOf(n)));
+    // the worker keeps nothing: every step's temp dir (sr-<job>-…) is gone
+    const leftovers = ["worker-a", "worker-b"].flatMap((w) => readdirSync(path.join(OUT, `tmp-${w}`)).filter((n) => n.startsWith("sr-")).map((n) => `${w}/${n}`));
+    check("worker temp dirs are empty after every job (it keeps no copy)", leftovers.length === 0, leftovers.slice(0, 3).join(", ") || "no sr-* left");
     const dump = execFileSync(path.join(PGBIN, "pg_dump"), ["-h", "127.0.0.1", "-p", String(PORT.pg), "-U", "postgres", "--data-only", "-T", "public.calls", "-T", "public.agents", "postgres"], { encoding: "utf8", maxBuffer: 1 << 28 });
     scan("database (every table except TR's own calls/agents rows) holds no planted value", norm(dump));
   }
@@ -443,7 +459,7 @@ async function main() {
     `# Sample redactor — end-to-end simulation ${STAMP}`,
     "",
     `- worker ${PIPELINE_VERSION}, schema ${SCHEMA_VERSION}; ${Math.round((Date.now() - t0) / 1000)} s`,
-    "- real: worker (next start + local Workflow World), training-library-admin + sample-redaction-bridge (Deno), RL-1 + worker migrations (Postgres)",
+    "- real: 2 worker processes (node src/worker.ts, pull model), training-library-admin + sample-redaction-bridge (Deno), RL-1 + worker migrations (Postgres)",
     "- faked: Supabase HTTP layer, Telnyx, AssemblyAI (verification pass listens to the redacted mp3), OpenRouter",
     "- live systems touched: none · values in the calls: fictional",
     "",

@@ -83,6 +83,8 @@ export class Fakes {
   readonly llm = { calls: 0, retries: 0, clips: 0 };
   readonly telnyx = { lookups: 0, expired: new Set<string>() };
   readonly webhooks: string[] = [];
+  /** while true, every transcript reads back as still processing (keeps a job mid-run for takedown / crash scenarios) */
+  holdAsr = false;
   readonly uploads: string[] = [];
   readonly downloads: string[] = [];
   readonly refusedStorage: string[] = [];
@@ -241,6 +243,7 @@ export class Fakes {
       }
       if (!t || this.deleted.has(m[1])) return this.json(res, 404, { error: "not found" });
       const { job: _j, pass: _p, ...pub } = t;
+      if (this.holdAsr) return this.json(res, 200, { id: pub.id, status: "processing" });
       return this.json(res, 200, pub);
     }
 

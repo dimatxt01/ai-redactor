@@ -4,7 +4,7 @@
 //   • provider.zdr + data_collection "deny": only zero-retention endpoints that
 //     don't collect data; no endpoint qualifies → the call fails, nothing is sent elsewhere
 //   • usage.cost (always returned) is the job's actual LLM spend
-import { RetryableError } from "workflow";
+import { RetryableError } from "./errors";
 import { z } from "zod";
 import { COST, env, MODELS } from "./config";
 import { jobError } from "./errors";

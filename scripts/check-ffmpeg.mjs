@@ -1,6 +1,6 @@
 // Build gate: ffmpeg-static downloads its binary in a postinstall script. An install with
 // --ignore-scripts (some CI) leaves it missing, and every job would then fail at render time.
-// Vercel runs install scripts; this makes a missing binary fail the build, not the first job.
+// Runs as postinstall and before tests: a missing binary fails the install / image build, not the first job.
 import { existsSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 const bin = createRequire(import.meta.url)("ffmpeg-static");

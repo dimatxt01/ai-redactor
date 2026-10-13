@@ -1,8 +1,0 @@
-{
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "nextjs",
-  "functions": {
-    "app/api/**/*": { "memory": 1024, "maxDuration": 60 },
-    "app/.well-known/workflow/v1/flow/route.js": { "memory": 3009, "maxDuration": 800 }
-  }
-}

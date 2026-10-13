@@ -2,8 +2,7 @@
 // into TR: job inputs, status, cost ledger, and signed storage URLs.
 import { env } from "./config";
 import { signBody } from "./signature";
-import { jobError } from "./errors";
-import { FatalError, RetryableError } from "workflow";
+import { FatalError, jobError, RetryableError } from "./errors";
 
 export type JobOptions = {
   bleep_pad_ms: number;
@@ -30,7 +29,7 @@ export type JobInputs = {
       channel_map: { customer: 0 | 1; agent: 0 | 1; verified: boolean };
     };
     created_at: string;
-    workflow_run_id: string | null;
+    workflow_run_id: string | null;   // the run that claimed the job (column name kept from the earlier design)
   };
   extra_terms: string[];
   idempotency_key: string;
@@ -100,4 +99,21 @@ export async function getWork(jobId: string, runId: string, name: string): Promi
 
 export async function getWorkJson<T>(jobId: string, runId: string, name: string): Promise<T> {
   return JSON.parse((await getWork(jobId, runId, name)).toString("utf8")) as T;
+}
+
+export type Poll = {
+  jobs: { job_id: string; idempotency_key: string }[];   // queued, to claim (at most `capacity`)
+  stop: string[];                                         // jobs this worker runs that were taken down / failed elsewhere
+  cleanup: { job_id: string; transcript_ids: string[] }[]; // no live run: vendor copies to delete, takedowns to finish
+  lost: number;                                            // running jobs the bridge just failed (their worker went quiet)
+};
+
+/** The worker's one regular call: heartbeats for the jobs it runs, plus work to pick up. */
+export function poll(worker: string, running: { job_id: string; run_id: string }[], capacity: number): Promise<Poll> {
+  return bridge<Poll>("poll", { worker, running, capacity });
+}
+
+/** Tell TR these AssemblyAI transcripts are deleted (the owning run reports here last; it also ends the heartbeat). */
+export function vendorPurged(jobId: string, runId: string, transcriptIds: string[]) {
+  return bridge<{ ok: true; left: number; deleted: boolean }>("vendor_purged", { job_id: jobId, run_id: runId, transcript_ids: transcriptIds });
 }

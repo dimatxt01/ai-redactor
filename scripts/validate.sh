@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Validation of the ai-redactor repo, on this machine only.
-# Touches NOTHING live: no Supabase project, no Vercel, no deploy. The only
+# Touches NOTHING live: no Supabase project, no deploy. The only
 # network calls are npm/deno downloads and, when keys are set, AssemblyAI +
 # OpenRouter on the synthetic test calls (every value in them is fictional).
 #
@@ -37,7 +37,6 @@ done
 if [ -f "$W/.env.local" ]; then set -a; . "$W/.env.local"; set +a; fi
 
 DENO=(npx -y deno@2.9.6)
-PORT=3199
 RESULTS=()
 FAILS=0
 n=0
@@ -85,11 +84,10 @@ else
 fi
 # not incremental: two incremental runs on one tsbuildinfo can block each other
 step "worker: typecheck" "tsc clean" node node_modules/.bin/tsc --noEmit --incremental false
-step "worker: unit tests (detectors, DSP, HMAC, logs)" "all passed" npx vitest run
-step "worker: production build (next + workflow)" "build ok" npx next build
+step "worker: unit tests (detectors, DSP, HMAC, retries, logs)" "all passed" npx vitest run
 
 FFMPEG="$(node -p 'require("ffmpeg-static")' 2>/dev/null)"
-RB="$("$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q rubberband && echo yes || echo 'no (resample fallback here; Vercel reports its own in /api/health)')"
+RB="$("$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q rubberband && echo yes || echo 'no (resample fallback on this machine)')"
 
 # ── 3. synthetic test calls ───────────────────────────────────────────────────
 if command -v say >/dev/null; then
@@ -112,39 +110,24 @@ callfmt() {
 }
 step "test calls: two channels + planted manifest" "every call stereo, manifest present" callfmt
 
-# ── 4. local worker: auth fails closed ────────────────────────────────────────
-smoke() {
-  local secret; secret="local-$(node -p 'crypto.randomUUID()')"
-  env -u ASSEMBLYAI_API_KEY -u OPENROUTER_API_KEY \
-    SAMPLE_REDACTOR_START_SECRET="$secret" SAMPLE_REDACTOR_BRIDGE_SECRET="local-bridge-$secret" \
-    TR_BRIDGE_URL="http://127.0.0.1:9/functions/v1/sample-redaction-bridge" \
-    node node_modules/next/dist/bin/next start -p $PORT >"$LOGDIR/next-start.log" 2>&1 &
-  local pid=$!
-  trap "kill $pid 2>/dev/null" RETURN
-  local i; for i in $(seq 1 60); do curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null && break; sleep 1; done
-  local h; h="$(curl -sf "http://127.0.0.1:$PORT/api/health")" || { echo "health never came up"; return 1; }
-  echo "health: $h"
-  echo "$h" | grep -q '"ok":true' && echo "$h" | grep -q '"pipeline_version":"sr-' || return 1
-  sign() { SECRET="$1" BODY="$2" SKEW="${3:-0}" node -e '
-    const c=require("crypto"); const t=Math.floor(Date.now()/1000)-Number(process.env.SKEW);
-    console.log(`t=${t},v1=${c.createHmac("sha256",process.env.SECRET).update(`${t}.${process.env.BODY}`).digest("hex")}`)'; }
-  code() { curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT$1" -H 'content-type: application/json' ${3:+-H "x-tr-signature: $3"} --data "$2"; }
-  local body='{"job_id":"not-a-uuid","idempotency_key":"validate"}' fails=0
-  expect() { local got; got="$(code "$2" "$3" "${4:-}")"; echo "$1: $got (want $5)"; [ "$got" = "$5" ] || fails=1; }
-  expect "jobs, unsigned"            /api/jobs   "$body" ""                                   401
-  expect "jobs, wrong secret"        /api/jobs   "$body" "$(sign wrong "$body")"              401
-  expect "jobs, 10 min old"          /api/jobs   "$body" "$(sign "$secret" "$body" 600)"      401
-  expect "jobs, body changed"        /api/jobs   "$body" "$(sign "$secret" '{"job_id":"x"}')" 401
-  expect "jobs, signed, bad job id"  /api/jobs   "$body" "$(sign "$secret" "$body")"          400
-  local nokey='{"job_id":"00000000-0000-4000-8000-000000000000","idempotency_key":"nope"}'
-  expect "jobs, signed, bad key"     /api/jobs   "$nokey" "$(sign "$secret" "$nokey")"        400
-  expect "delete, unsigned"          /api/delete '{"job_ids":[]}' ""                          401
-  expect "delete, wrong secret"      /api/delete '{"job_ids":[]}' "$(sign wrong '{"job_ids":[]}')" 401
-  if grep -qF "$secret" "$LOGDIR/next-start.log"; then echo "the secret reached the server log"; fails=1; fi
-  echo "server log lines: $(wc -l < "$LOGDIR/next-start.log")"
-  return $fails
+# ── 4. the worker process itself ──────────────────────────────────────────────
+selfcheck() {   # refuses without config; with config (dummy values) the bundled ffmpeg must run here
+  if env -u TR_BRIDGE_URL -u SAMPLE_REDACTOR_BRIDGE_SECRET -u ASSEMBLYAI_API_KEY -u OPENROUTER_API_KEY node --import tsx src/check.ts; then
+    echo "check passed without any config"; return 1; fi
+  TR_BRIDGE_URL=https://example.invalid/functions/v1/sample-redaction-bridge SAMPLE_REDACTOR_BRIDGE_SECRET=x ASSEMBLYAI_API_KEY=x OPENROUTER_API_KEY=x \
+    node --import tsx src/check.ts
 }
-step "worker: local server, HMAC fails closed" "health ok; unsigned/wrong/stale/tampered → 401" smoke
+step "worker: self-check (refuses without config; ffmpeg runs)" "missing env refused; ffmpeg ok" selfcheck
+if docker info >/dev/null 2>&1; then
+  dockerbuild() {
+    docker build -q -t ai-redactor:validate . && \
+    docker run --rm -e TR_BRIDGE_URL=https://example.invalid/x -e SAMPLE_REDACTOR_BRIDGE_SECRET=x -e ASSEMBLYAI_API_KEY=x -e OPENROUTER_API_KEY=x \
+      ai-redactor:validate node --import tsx src/check.ts
+  }
+  step "docker: image builds; ffmpeg runs inside it (linux)" "image ok" dockerbuild
+else
+  skip "docker: image build" "Docker not running"
+fi
 
 # ── 5. TrueRing side (what can run without a TrueRing checkout) ──────────────
 cd "$TRS/supabase/functions"
@@ -192,7 +175,7 @@ hygiene() {
   if echo "$files" | while read -r f; do [ -f "$f" ] && echo "$f"; done | xargs grep -nIE \
       'sk-or-v1-[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{32,}|eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{20,}|KEY[0-9A-F]{24,}|(ASSEMBLYAI_API_KEY|OPENROUTER_API_KEY|_SECRET)=[^.$ "`]{12,}' 2>/dev/null; then
     echo "^ secret-shaped value in a repo file"; bad=1; fi
-  for f in .env.local fixtures/out/x.mp3 .next/x sim-out/x; do
+  for f in .env.local fixtures/out/x.mp3 sim-out/x; do
     git -C "$W" check-ignore -q "$f" || { echo "$f is NOT gitignored"; bad=1; }
   done
   if echo "$files" | grep -E '(^|/)\.env($|\.)|fixtures/out/|sim-out/|\.mp3$|\.wav$' | grep -v '\.env\.example$'; then echo "^ env file or audio would be committed"; bad=1; fi

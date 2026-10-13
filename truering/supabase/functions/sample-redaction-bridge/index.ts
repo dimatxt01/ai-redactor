@@ -1,5 +1,5 @@
-// sample-redaction-bridge — the ONLY door the ai-redactor worker (separate repo and
-// Vercel project) has into TR. The worker holds no Supabase key: every read,
+// sample-redaction-bridge — the ONLY door the ai-redactor worker (separate repo; a background
+// process that polls this function) has into TR. The worker holds no Supabase key: every read,
 // status write and storage URL goes through here, scoped to ONE job.
 //
 // TR_PLAN RL-3 (Dmitry 2026-10-13: the bridge replaces the signed callback).
@@ -9,13 +9,22 @@
 // artifact prefix (RL-1 buckets; paths carry the job id, never calls.id, because agents
 // can read published training_library_calls rows).
 //
-// Exactly-once: the first workflow run to `claim` a queued job owns it
+// Pull model: TR never calls the worker. The worker (a plain Node process) calls `poll` every ~20 s:
+// it gets queued jobs to claim, refreshes the heartbeat of the jobs it runs, learns which of them to stop
+// (takedown / failed elsewhere), and gets the jobs whose AssemblyAI copies still need deleting.
+//
+// Exactly-once: the first worker run to `claim` a queued job owns it
 // (compare-and-swap on status + workflow_run_id). Every later action must carry
-// that run_id, so a duplicate start, a replayed step from a stale run, or a
+// that run_id, so two workers polling at once, a retried request, or a
 // repeated `complete` / `fail` cannot act twice.
 //
+// Liveness: the owning run's polls keep heartbeat_at fresh. A running job whose heartbeat is older than
+// SAMPLE_WORKER_STALE_S (default 300) is failed here (`internal: worker stopped responding`), its copies
+// purged, and its vendor transcripts handed to the next poll's cleanup list.
+//
 // Takedown: once training-library-admin's delete sets delete_requested_at, every
-// action except `purge` (and `asr`, which only records ids for deletion) refuses the job.
+// action except `purge`, `asr` (records ids for deletion) and `vendor_purged` refuses the job.
+// The job becomes 'deleted' when the worker reports its vendor copies gone (`vendor_purged`).
 //
 // Caps: SAMPLE_JOB_CAP_USD (default 2) per job; SAMPLE_MONTH_CAP_USD (default 100)
 // per UTC month over public.sample_month_committed_usd() (running jobs count their
@@ -28,7 +37,7 @@
 // `complete` hands everything to public.sample_library_ingest: job -> done plus the RL-1
 // training_library_calls / _call_sources / _clips rows, in one transaction, idempotent per job.
 //
-// Actions: job | claim | source | sign | status | cost | asr | complete | fail | purge
+// Actions: poll (no job_id) | job | claim | source | sign | status | cost | asr | complete | fail | purge | vendor_purged
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { verifySampleSignature } from '../_shared/sampleSignature.ts';
@@ -51,7 +60,7 @@ const REQUIRED = ['redacted_audio', 'transcript_json', 'pii_spans_json', 'clips_
 type Job = {
   id: string; call_id: string; version: number; idempotency_key: string; status: string; options: Record<string, unknown>;
   call_meta: Record<string, unknown>; created_at: string; workflow_run_id: string | null; cost_usd: number;
-  asr_transcript_ids: string[]; delete_requested_at: string | null; metrics: Record<string, unknown>;
+  asr_transcript_ids: string[]; delete_requested_at: string | null; metrics: Record<string, unknown>; heartbeat_at: string | null;
 };
 
 const numEnv = (k: string, d: number) => {
@@ -81,13 +90,76 @@ Deno.serve(async (req) => {
   let body: Record<string, any>;
   try { body = JSON.parse(raw); } catch { return json({ error: 'bad json', error_code: 'BAD_JSON' }, 400); }
   const action = String(body.action ?? '');
+  const staleMs = numEnv('SAMPLE_WORKER_STALE_S', 300) * 1000;
+
+  const removePrefixOf = async (bucket: string, prefix: string) => {
+    for (const p of [prefix, `${prefix}/clips`]) {
+      const { data: files } = await supabase.storage.from(bucket).list(p, { limit: 1000 });
+      const names = (files ?? []).filter((f) => f.id).map((f) => `${p}/${f.name}`);   // folders have no id
+      if (!names.length) continue;
+      const { error } = await supabase.storage.from(bucket).remove(names);
+      if (error) console.error('[sample-redaction-bridge] cleanup failed:', bucket, prefix, error.message);
+    }
+  };
+
+  // ── poll: the worker's only way to learn about work (no job_id) ──────────
+  if (action === 'poll') {
+    const nowIso = new Date().toISOString();
+    const staleCut = new Date(Date.now() - staleMs).toISOString();
+    const running = (Array.isArray(body.running) ? body.running : []).slice(0, 20)
+      .filter((r: any) => /^[0-9a-f-]{36}$/i.test(String(r?.job_id)) && /^[A-Za-z0-9_-]{4,100}$/.test(String(r?.run_id)));
+    const capacity = Math.max(0, Math.min(10, Math.floor(Number(body.capacity) || 0)));
+
+    // 1. heartbeats of the jobs this worker runs; stop the ones taken down or failed elsewhere
+    const stop: string[] = [];
+    for (const r of running) {
+      const { data: hb, error } = await supabase.from('sample_redaction_jobs').update({ heartbeat_at: nowIso })
+        .eq('id', r.job_id).eq('workflow_run_id', r.run_id).select('status, delete_requested_at').maybeSingle();
+      if (error) return json({ error: error.message, error_code: 'DB' }, 500);
+      if (!hb || hb.delete_requested_at || hb.status === 'failed' || hb.status === 'deleted') stop.push(r.job_id);
+    }
+
+    // 2. running jobs whose worker went quiet: fail them and purge what they left in TR storage
+    const { data: lost, error: lostErr } = await supabase.from('sample_redaction_jobs').update({
+      status: 'failed', error_code: 'internal', error_detail: 'worker stopped responding', completed_at: nowIso,
+    }).not('status', 'in', '(queued,done,failed,deleted)').lt('heartbeat_at', staleCut).select('id');
+    if (lostErr) return json({ error: lostErr.message, error_code: 'DB' }, 500);
+    for (const j of lost ?? []) { await removePrefixOf(SRC, j.id); await removePrefixOf(LIB, j.id); }
+
+    // 3. cleanup: vendor copies still to delete, or a takedown waiting for the worker; no live run owns them
+    const quiet = `heartbeat_at.is.null,heartbeat_at.lt.${staleCut}`;
+    const [{ data: takedowns }, { data: leftovers }] = await Promise.all([
+      supabase.from('sample_redaction_jobs').select('id, asr_transcript_ids')
+        .not('delete_requested_at', 'is', null).neq('status', 'deleted').in('status', ['done', 'failed']).or(quiet).limit(25),
+      supabase.from('sample_redaction_jobs').select('id, asr_transcript_ids')
+        .in('status', ['done', 'failed']).neq('asr_transcript_ids', '{}').or(quiet).limit(25),
+    ]);
+    const cleanup = new Map<string, string[]>();
+    for (const j of [...(takedowns ?? []), ...(leftovers ?? [])]) cleanup.set(j.id, j.asr_transcript_ids ?? []);
+
+    // 4. queued jobs to claim, oldest first, inside the 2 h window
+    let jobs: { job_id: string; idempotency_key: string }[] = [];
+    if (capacity > 0) {
+      const { data: q, error: qErr } = await supabase.from('sample_redaction_jobs').select('id, idempotency_key')
+        .eq('status', 'queued').is('delete_requested_at', null)
+        .gte('created_at', new Date(Date.now() - JOB_DEADLINE_MS).toISOString())
+        .order('created_at', { ascending: true }).limit(capacity);
+      if (qErr) return json({ error: qErr.message, error_code: 'DB' }, 500);
+      jobs = (q ?? []).map((j) => ({ job_id: j.id, idempotency_key: j.idempotency_key }));
+    }
+    return json({
+      jobs, stop, lost: (lost ?? []).length,
+      cleanup: [...cleanup].map(([job_id, transcript_ids]) => ({ job_id, transcript_ids })),
+    });
+  }
+
   const jobId = String(body.job_id ?? '');
   const runId = typeof body.run_id === 'string' ? body.run_id : '';
   if (!/^[0-9a-f-]{36}$/i.test(jobId)) return json({ error: 'job_id required', error_code: 'BAD_JOB_ID' }, 400);
 
   const { data: job, error: jobErr } = await supabase
     .from('sample_redaction_jobs')
-    .select('id, call_id, version, idempotency_key, status, options, call_meta, created_at, workflow_run_id, cost_usd, asr_transcript_ids, delete_requested_at, metrics')
+    .select('id, call_id, version, idempotency_key, status, options, call_meta, created_at, workflow_run_id, cost_usd, asr_transcript_ids, delete_requested_at, metrics, heartbeat_at')
     .eq('id', jobId)
     .maybeSingle<Job>();
   if (jobErr) return json({ error: jobErr.message, error_code: 'DB' }, 500);
@@ -98,15 +170,7 @@ Deno.serve(async (req) => {
   const monthCap = numEnv('SAMPLE_MONTH_CAP_USD', 100);
   const tombstoned = !!job.delete_requested_at;
 
-  const removePrefix = async (bucket: string) => {
-    for (const p of [prefix, `${prefix}/clips`]) {
-      const { data: files } = await supabase.storage.from(bucket).list(p, { limit: 1000 });
-      const names = (files ?? []).filter((f) => f.id).map((f) => `${p}/${f.name}`);   // folders have no id
-      if (!names.length) continue;
-      const { error } = await supabase.storage.from(bucket).remove(names);
-      if (error) console.error('[sample-redaction-bridge] cleanup failed:', bucket, job.id, error.message);
-    }
-  };
+  const removePrefix = (bucket: string) => removePrefixOf(bucket, prefix);
   const logEvent = async (event_type: string, metadata: Record<string, unknown>) => {
     const { error } = await supabase.from('security_activity_log').insert({ event_type, metadata });
     if (error) console.error('[sample-redaction-bridge] log failed:', event_type, error.message);
@@ -138,6 +202,28 @@ Deno.serve(async (req) => {
       if (error) return json({ error: error.message, error_code: 'DB' }, 500);
     }
     return json({ ok: true });
+  }
+
+  // ── vendor_purged: the worker deleted these AssemblyAI transcripts; a run that ended reports here last ──
+  // From the owning run (it has stopped), or from any worker once no live run owns the job (heartbeat stale).
+  // A takedown completes here: once no vendor copy is left, TR storage is purged again and the job is 'deleted'.
+  if (action === 'vendor_purged') {
+    const owner = !!runId && job.workflow_run_id === runId;
+    const quiet = !job.heartbeat_at || Date.now() - new Date(job.heartbeat_at).getTime() > staleMs;
+    if (!owner && !(quiet && TERMINAL.has(job.status))) return json({ error: 'a live run owns this job', error_code: 'RUN_LIVE' }, 409);
+    const gone = new Set((Array.isArray(body.transcript_ids) ? body.transcript_ids : []).map(String));
+    const left = (job.asr_transcript_ids ?? []).filter((t) => !gone.has(t));
+    const patch: Record<string, unknown> = { asr_transcript_ids: left };
+    if (owner) patch.heartbeat_at = null;   // the run has ended
+    const finish = tombstoned && left.length === 0 && TERMINAL.has(job.status);
+    if (finish) {
+      await removePrefix(SRC);
+      await removePrefix(LIB);
+      Object.assign(patch, { status: 'deleted', deleted_at: new Date().toISOString(), heartbeat_at: null });
+    }
+    const { error } = await supabase.from('sample_redaction_jobs').update(patch).eq('id', job.id);
+    if (error) return json({ error: error.message, error_code: 'DB' }, 500);
+    return json({ ok: true, left: left.length, deleted: finish });
   }
 
   if (tombstoned) return json({ error: 'sample was deleted', error_code: 'JOB_TERMINAL', status: job.status }, 409);
@@ -202,7 +288,7 @@ Deno.serve(async (req) => {
     }
     const nowIso = new Date().toISOString();
     const { data: claimed, error } = await supabase.from('sample_redaction_jobs')
-      .update({ status: 'fetching', workflow_run_id: runId, started_at: nowIso })
+      .update({ status: 'fetching', workflow_run_id: runId, started_at: nowIso, heartbeat_at: nowIso })
       .eq('id', job.id).eq('status', 'queued')
       .or(`workflow_run_id.is.null,workflow_run_id.eq.${runId}`)
       .select('id').maybeSingle();

@@ -1,9 +1,9 @@
 # True Ring: Recording Redaction + Coaching Service, spec v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers; delivery revised 2026-10-13: pull through the bridge, no callback)
 
-This is a separate service, the `ai-redactor` worker (its own repo and Vercel project; Vercel Workflow + ffmpeg, AssemblyAI for speech, OpenRouter for text). True Ring (TR) starts it per call; the worker pulls the call's inputs and pushes its results **through one TR edge function, `sample-redaction-bridge`**, straight into TR's storage and tables. TR AMs/admins pick sales calls and, after a human QA listen, publish the results to an internal **training** Recording Library (smart clips of the key sale moments plus AI coaching notes).
+This is a separate service, the `ai-redactor` worker: its own repo, a plain Node background process in one container, with ffmpeg, AssemblyAI for speech and OpenRouter for text. It opens no port. True Ring (TR) queues a job per call; the worker **polls** for it and pulls the call's inputs and pushes its results **through one TR edge function, `sample-redaction-bridge`**, straight into TR's storage and tables. TR AMs/admins pick sales calls and, after a human QA listen, publish the results to an internal **training** Recording Library (smart clips of the key sale moments plus AI coaching notes).
 Status: built (worker + TR side on branch `feat/sample-redaction`), not deployed. TR_PLAN.md RL-2/RL-3 describe the TR side.
 
-**The service is input/output only.** It has no database, tables, buckets or Supabase key. Every recording, clip, transcript and coaching note is stored on TR's side (RL-1 buckets and tables). Its temp files and AssemblyAI's copies are deleted every run; OpenRouter keeps nothing (zero data retention, no training). Its only state is the Workflow run log, which carries ids, hashes and counts, never content, and is deleted when the run ends (§4).
+**The service is input/output only.** It has no database, tables, buckets or Supabase key. Every recording, clip, transcript and coaching note is stored on TR's side (RL-1 buckets and tables). Its temp files and AssemblyAI's copies are deleted every run; OpenRouter keeps nothing (zero data retention, no training). It keeps no state between jobs; its logs carry ids, hashes and counts, never content (§4).
 
 ## 1. Input contract (from real data)
 
@@ -29,11 +29,11 @@ Fetching:
 - When the worker reaches its fetch step it asks the bridge (`source`) for a **fresh Telnyx link**, the same lookup `recording-proxy` does, and downloads it at once. It never stores the URL. A new link is fetched on every attempt (they expire in ~10 min).
 - Twilio-era recordings are out of v1 (`unsupported_source`).
 
-Start (TR `training-library-admin` → worker `POST /api/jobs`, HMAC). The body is ids only:
+Start: TR `training-library-admin` only writes the job row (`sample_job_insert`: the key, options, call meta, the reserved cost; status `queued`). TR never calls the worker. Within one poll interval (~20 s) the worker's `poll` returns it (ids only):
 ```json
-{ "job_id": "6e1e1645-67cc-4cb1-9a0e-2c1f0d6f9e11", "idempotency_key": "call:2948f3a3-d352-4e3b-8976-1af6b7fb0230:v1" }
+{ "jobs": [{ "job_id": "6e1e1645-67cc-4cb1-9a0e-2c1f0d6f9e11", "idempotency_key": "call:2948f3a3-d352-4e3b-8976-1af6b7fb0230:v1" }], "stop": [], "cleanup": [], "lost": 0 }
 ```
-TR first writes the job row (`sample_job_insert`: the key, options, call meta, the reserved cost). The worker then pulls the job's inputs from the bridge (`job`):
+The worker claims it and then pulls the job's inputs from the bridge (`job`):
 ```json
 {
   "job": {
@@ -148,17 +148,21 @@ TR first writes the job row (`sample_job_insert`: the key, options, call meta, t
 **Auth:**
 - Both directions use an HMAC-SHA256 header: `X-TR-Signature: t=<unix>,v1=<hex(hmac(secret, t + "." + raw_body))>`.
 - Reject requests outside ±5 min.
-- Each direction has its own secret: `SAMPLE_REDACTOR_START_SECRET` (TR → worker) and `SAMPLE_REDACTOR_BRIDGE_SECRET` (worker → bridge). They live only in Supabase function secrets and the worker's Vercel env. A missing secret rejects.
+- One direction, one secret: every request goes worker → bridge, signed with `SAMPLE_REDACTOR_BRIDGE_SECRET`. It lives only in the Supabase function secrets and the worker host's secret store. A missing secret rejects.
 
 **Endpoints:**
-- Worker (called by TR): `POST /api/jobs` (start a run), `POST /api/delete` (cancel runs, delete AssemblyAI's copies), `GET /api/health` (no data).
-- Bridge (called by the worker; the worker's only way into TR): `job` (inputs), `claim`, `source` (fresh Telnyx link), `sign` (signed URLs, only under `sample-src/<job_id>/` and `training-library/<job_id>/`), `status`, `cost`, `asr` (records a vendor transcript id for deletion), `complete`, `fail`, `purge`. Every action names one job; after `claim`, every action must come from the run that claimed it.
+- Worker: none. It is a background process with no open port.
+- Bridge (called by the worker; the worker's only way into TR):
+  - `poll` (no job): claimable jobs; heartbeats for the jobs the worker runs; `stop` (taken down or failed elsewhere); `cleanup` (finished jobs with no live run whose AssemblyAI copies still need deleting). It also fails running jobs whose heartbeat is older than `SAMPLE_WORKER_STALE_S` (default 300 s).
+  - Per job: `job` (inputs), `claim`, `source` (fresh Telnyx link), `sign` (signed URLs, only under `sample-src/<job_id>/` and `training-library/<job_id>/`), `status`, `cost`, `asr` (records a vendor transcript id for deletion), `complete`, `fail`, `purge`, and `vendor_purged`, the run's last call, which ends its heartbeat and completes a takedown.
+  - After `claim`, every action must come from the run that claimed it.
 
 **Lifecycle:**
-- Submit: TR writes the job (key `call:<id>:v<n>`; the same key returns the existing job, `:v2` reprocesses) and calls `POST /api/jobs`.
-- Exactly once: the first run to `claim` a queued job owns it (compare-and-swap); a duplicate start, or a start whose key does not match the job, exits without touching it.
+- Submit: TR writes the job (key `call:<id>:v<n>`; the same key returns the existing job, `:v2` reprocesses). The worker picks it up on its next poll.
+- Exactly once: the first run to `claim` a queued job owns it (compare-and-swap); a second worker polling at the same time loses the claim and drops it.
+- Liveness: a dead worker's jobs are failed after `SAMPLE_WORKER_STALE_S` without a heartbeat (`internal: worker stopped responding`); the AM retries.
 - Status: there is no `GET /jobs/:id`; TR reads its own job row.
-- `fetch_expired` → TR's `retry` restarts the job with the same key (the next attempt fetches a fresh link).
+- `fetch_expired` → TR's `retry` queues the job again with the same key (the next attempt fetches a fresh link).
 - A job running over 2 h is marked `failed:timeout` (bridge, and TR's sweep).
 
 **Storage (TR side only; RL-1 buckets, private):**
@@ -166,7 +170,10 @@ TR first writes the job row (`sample_job_insert`: the key, options, call meta, t
 - `training-library/<job_id>/`: the artifacts. Served only as short-lived signed links (staff via `training-library-admin` `link`, access logged).
 - Paths carry the job id, never `calls.id`.
 
-**Deletion (takedown):** TR's `delete` tombstones the call first (every bridge action then refuses it), calls the worker's `POST /api/delete` (cancel runs, wait for them to stop, delete AssemblyAI's transcripts), purges both buckets, and withdraws and empties the library rows. The job is `deleted` only after the worker answers 200; a 207 means try again.
+**Deletion (takedown):**
+1. TR's `delete` tombstones the call first; every bridge action then refuses it. It fails a running job, purges both buckets, and withdraws and empties the library rows.
+2. A job with no AssemblyAI copy and no live run is `deleted` at once.
+3. Otherwise the worker learns it on its next poll (`stop`, or `cleanup` if its run is gone), deletes the AssemblyAI copies and reports `vendor_purged`. The bridge then purges again and marks the job `deleted`.
 
 **TR tables (built: RL-1 `20261012180000_training_library` + worker columns `20261013090000_sample_redaction_worker`):**
 - `sample_redaction_jobs`: id, call_id, idempotency_key unique, status, qa_flag, qa_reasons jsonb, metrics jsonb, engine jsonb, submitted_by, timestamps.
@@ -193,16 +200,18 @@ TR first writes the job row (`sample_job_insert`: the key, options, call meta, t
   - **Health details:** bleep conditions and medications in the audio. The `application` clip has no audio by default.
   - **Access:** RLS-gated, short signed links, no downloads in the UI, access logged.
 - **Retention:**
-  - Service: none. Temp files are deleted at the end of every step; AssemblyAI transcripts are deleted when the job ends (and again on takedown). The Workflow run log holds ids, hashes and counts only, and each run is started with retention 0, so its inputs, outputs and event payloads are deleted as soon as it ends.
+  - Service: none. Temp files are deleted at the end of every step; AssemblyAI transcripts are deleted when the job ends (and again on takedown). The worker keeps nothing between jobs; its logs hold ids, hashes and counts only.
   - TR `sample-src` copies: deleted after the job finishes.
   - Library: reviewed every 12 months; withdrawn on agent revoke or a consumer request.
 - **Vendors:** zero data retention, no training on the data. LLM calls get transcript text only, never audio.
 
 ## 6. Implementation (in-house, no n8n)
 
-- `ai-redactor`, a separate repo and Vercel project: Next.js routes for the three endpoints, one durable Vercel Workflow run per job (claim → fetch → transcribe → detect → render → clips + coaching → verify → complete), ffmpeg (`ffmpeg-static`, shipped with every function) for bleeping, mixing and clips.
-- Long calls: the run sleeps while AssemblyAI works (vendor webhook to wake it, polling as a fallback); no function holds a long request open.
-- The run passes only ids, hashes, counts and offsets between steps; text lives in TR's `sample-src/<job_id>/` scratch in between.
+- `ai-redactor`, a separate repo: one Node 22 process in a Docker image (any always-on container host, outbound HTTPS only), with ffmpeg (`ffmpeg-static`) for bleeping, mixing and clips.
+- It runs each job start to finish (claim → fetch → transcribe → detect → render → clips + coaching → verify → complete), up to `WORKER_CONCURRENCY` (2) at a time, retrying transient errors per step.
+- Long calls: the worker polls AssemblyAI's status with its own key while it works (no inbound webhook).
+- Between steps it holds only ids, hashes, counts and offsets; text lives in TR's `sample-src/<job_id>/` scratch in between.
+- A restart (SIGTERM) fails the running jobs as `internal: worker restarted`; the AM retries.
 
 ## Open items to verify
 - Customer and agent channel order in the dual-channel mp3.
@@ -219,7 +228,7 @@ TR first writes the job row (`sample_job_insert`: the key, options, call meta, t
   - Transcribe each channel separately; this gives speaker labels for free.
 - **Idempotency:**
   - Submitting an existing `idempotency_key` returns the existing job (same `job_id`); the job never runs twice.
-  - A duplicate `POST /api/jobs` starts a run that loses the `claim` and exits. `complete`, `fail` and the cost ledger (per item) are idempotent, so a replayed step does nothing twice.
+  - Two workers that see the same queued job: one wins the `claim`, the other drops it. `complete`, `fail` and the cost ledger (per item) are idempotent, so a retried step does nothing twice.
 - **Length and timeouts:**
   - Plan for **60 min max** (49-min calls exist), about 60 MB mp3. Reject anything over 60 min (±5%) with `bad_audio:too_long`.
   - Everything is async: speech-to-text through the vendor's async API with a webhook or polling, never a synchronous HTTP call.
@@ -246,10 +255,10 @@ TR first writes the job row (`sample_job_insert`: the key, options, call meta, t
   - Never use real customer calls as fixtures.
 - **Retries:**
   - Fetch: a fresh link per attempt. If Telnyx no longer has the recording (or the download is refused), fail with `fetch_expired`; TR's retry restarts the job.
-  - STT, LLM and bridge calls: retried with backoff by the workflow step (transient errors only).
+  - STT, LLM and bridge calls: the step is retried with backoff (transient errors only, up to 4 tries).
 - **Logging:** log job_id, call_id, status, timings, counts and cost only. **Never** transcripts, PII text, signed URLs or secrets. Redact URLs to the host.
 - **Secrets:**
-  - Separate HMAC secrets for each direction. Rotate every 90 days or on suspected exposure, with a 24 h overlap where both old and new are accepted (`v1=` signature header supports several keys).
-  - Vendor keys stay in the worker's Vercel env only.
+  - One HMAC secret (worker → bridge). Rotate every 90 days or on suspected exposure, with a 24 h overlap where both old and new are accepted (`v1=` signature header supports several keys).
+  - Vendor keys stay in the worker host's secret store only.
 - **Deletion:**
-  - `POST /api/delete` (HMAC) cancels the job's runs, waits for them to stop, deletes AssemblyAI's transcripts and schedules one more purge of TR scratch after every signed upload URL has expired. It answers 200 when everything is gone, 207 when something must be retried. The service holds no other copy.
+  - Takedowns reach the worker through `poll` (`stop` / `cleanup`). It stops the run, deletes AssemblyAI's transcripts and reports `vendor_purged`; nothing is left in flight once a run returns, and the bridge purges TR storage again before marking the job `deleted`. The service holds no other copy.

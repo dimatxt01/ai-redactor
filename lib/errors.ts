@@ -1,7 +1,20 @@
 // Job-level failure codes (sample_redaction_jobs.error_code). A JobError ends the
-// job; its message is short and generic — it lands in the workflow event log and
+// job; its message is short and generic — it lands in the worker log and
 // in error_detail, so it must never contain transcript text.
-import { FatalError } from "workflow";
+/** Not retried: the job ends with this error. */
+export class FatalError extends Error {
+  constructor(message: string) { super(message); this.name = "FatalError"; }
+}
+/** Transient (network, 429, 5xx): the step is retried after `retryAfter` ("20s", "1m"). */
+export class RetryableError extends Error {
+  readonly retryAfterMs: number;
+  constructor(message: string, opts: { retryAfter?: string } = {}) {
+    super(message);
+    this.name = "RetryableError";
+    const m = /^(\d+)(s|m)$/.exec(opts.retryAfter ?? "");
+    this.retryAfterMs = m ? Number(m[1]) * (m[2] === "m" ? 60_000 : 1000) : 10_000;
+  }
+}
 
 export type JobErrorCode =
   | "fetch_expired"

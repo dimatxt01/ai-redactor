@@ -66,6 +66,7 @@ SELECT pg_temp.expect_fail($q$INSERT INTO sample_redaction_jobs (call_id, versio
 SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET cost_usd = 0 WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM resetting spend');
 SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET reserved_usd = 0 WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM resetting the reservation');
 SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET workflow_run_id = 'wrun_evil' WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM hijacking the run');
+SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET heartbeat_at = now() WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM faking a worker heartbeat');
 SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET delete_requested_at = now() WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM setting the tombstone');
 SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET created_at = now() - interval '40 days' WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM moving a job out of the month');
 UPDATE sample_redaction_jobs SET qa_reasons = '["note"]' WHERE call_id = 'cccccccc-0000-0000-0000-000000000002';
