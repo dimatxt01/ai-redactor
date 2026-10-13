@@ -1,0 +1,82 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 8b1bfb52..96b1759c 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -85,6 +85,7 @@ const Sales = lazy(() => import("./pages/admin/Sales"));
+ const AgentActivityReport = lazy(() => import("./pages/admin/AgentActivityReport"));
+ const AccountManagers = lazy(() => import("./pages/admin/AccountManagers"));
+ const CallQuality = lazy(() => import("./pages/admin/CallQuality"));
++const SampleLibrary = lazy(() => import("./pages/admin/SampleLibrary"));
+ const PromoCodes = lazy(() => import("./pages/admin/PromoCodes"));
+ const RtbDashboard = lazy(() => import("./pages/admin/RtbDashboard"));
+ const RtbRefRedirect = lazy(() => import("./pages/admin/RtbRefRedirect"));
+@@ -279,6 +280,7 @@ const App = () => {
+               <Route path="osama-report" element={<AgentActivityReport slug="osama-report" />} />
+               <Route path="account-managers" element={<AccountManagers />} />
+               <Route path="call-quality" element={<CallQuality />} />
++              <Route path="sample-library" element={<SampleLibrary />} />
+               <Route path="promos" element={<PromoCodes />} />
+               <Route path="pings" element={<RtbDashboard />} />
+               <Route path="rtb" element={<RedirectKeepSearch to="/admin/pings" />} />
+diff --git a/src/components/AdminLayout.tsx b/src/components/AdminLayout.tsx
+index 21936b93..1864e23e 100644
+--- a/src/components/AdminLayout.tsx
++++ b/src/components/AdminLayout.tsx
+@@ -23,6 +23,7 @@ import {
+   LifeBuoy,
+   Radar,
+   Inbox,
++  Library,
+ } from "lucide-react";
+ import { Button } from "@/components/ui/button";
+ import { supabase } from "@/integrations/supabase/client";
+@@ -375,6 +376,7 @@ const AdminLayout = () => {
+           { name: "Dashboard", href: "/admin", icon: LayoutDashboard, end: true },
+           { name: "Reporting", href: "/admin/reporting", icon: TrendingUp },
+           { name: "Call Quality", href: "/admin/call-quality", icon: BarChart3 },
++          { name: "Sample Library", href: "/admin/sample-library", icon: Library },
+           { name: "Call Logs", href: "/admin/call-logs", icon: FileText },
+           { name: "Sales", href: "/admin/sales", icon: DollarSign },
+           { name: "Call Capacity", href: "/admin/call-capacity", icon: Gauge },
+diff --git a/supabase/config.toml b/supabase/config.toml
+index c268681d..79514d6c 100644
+--- a/supabase/config.toml
++++ b/supabase/config.toml
+@@ -243,3 +243,11 @@ verify_jwt = false
+ # internal_fn_secret, or service-role bearer) => verify_jwt=false; in-body guard: checkInternalAuth.
+ [functions.send-publisher-notice]
+ verify_jwt = false
++
++# Sample library (spec v0.1 2026-10-12): admin browser (JWT) => verify_jwt=false; in-body guard: getClaims + user_roles admin|superadmin
++[functions.sample-library-admin]
++verify_jwt = false
++
++# Sample library: sample-redactor worker (Vercel) => verify_jwt=false; in-body guard: X-TR-Signature HMAC (SAMPLE_REDACTOR_BRIDGE_SECRET, ±300s, missing secret rejects)
++[functions.sample-redaction-bridge]
++verify_jwt = false
+diff --git a/supabase/functions/integrity-audit/manifest.json b/supabase/functions/integrity-audit/manifest.json
+index 80b783ec..a67f9890 100644
+--- a/supabase/functions/integrity-audit/manifest.json
++++ b/supabase/functions/integrity-audit/manifest.json
+@@ -1,5 +1,5 @@
+ {
+-  "manifest_version": "2026-10-11.2",
++  "manifest_version": "2026-10-12.1",
+   "generated_from": "live catalog, project snwzhaylpbxrjaebcbib, 2026-08-03 ~22:00Z (post BUG-033 apply). Reviewed like code: every change to this file is a deliberate statement about what production SHOULD be.",
+   "flags": {
+     "must_exist_disabled_forever": [
+@@ -685,6 +685,14 @@
+     {
+       "table": "notification_email_outbox",
+       "trigger": "notification_email_outbox_mute_skip"
++    },
++    {
++      "table": "sample_library_approvals",
++      "trigger": "sample_library_approvals_append_only"
++    },
++    {
++      "table": "sample_library",
++      "trigger": "sample_library_status_gate"
+     }
+   ],
+   "rls": {

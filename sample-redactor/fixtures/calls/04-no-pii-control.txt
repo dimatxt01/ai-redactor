@@ -1,0 +1,8 @@
+# Control: small numbers and ordinary talk that must NOT be bleeped (false-positive check).
+# meta: agent=Dana Whitfield; caller=Gloria Banks
+A: How are you doing today?
+C: Oh I'm fine, I have two kids and five grandkids.
+A: That's wonderful. This plan has three parts.
+C: Okay, give me one second.
+A: Take your time. We cover burial, final bills, and the rest.
+C: That sounds good to me.

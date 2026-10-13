@@ -1,0 +1,16 @@
+# Read-backs split across turns, double/triple, "oh", phonetic spelling, spoken email, bank draft.
+# meta: agent=Marcus Bell; caller=Loretta Quinlan
+A: This is [[NAME:Marcus]] again, am I speaking with [[NAME:Loretta]]?
+C: Yes, [[NAME:Loretta Quinlan]], that's Q as in queen.
+A: Great. For the bank draft, what's the routing number?
+C: [[BANK:oh one one]]
+A: [[BANK:oh one one]]
+C: [[BANK:oh oh oh oh one five]].
+A: And the account number?
+C: [[BANK:double four seven triple two eight one]].
+A: Do you have an email for the confirmation?
+C: It's [[EMAIL:loretta q fifty two at gmail dot com]].
+A: Spell your last name for me once more?
+C: [[NAME:Q as in queen U I N L A N]].
+A: And your zip code?
+C: [[ADDRESS:three oh three oh one]].

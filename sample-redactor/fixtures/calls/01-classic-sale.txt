@@ -1,0 +1,27 @@
+# Classic final-expense sale. Every value is fictional (SSN 9xx range, 555-01xx phone, Visa test card, CMS example MBI, Fed example routing number).
+# meta: agent=Dana Whitfield; caller=Harold Pemberton
+A: Thank you for calling, this is [[NAME:Dana]] with [[TERM:Mutual of Omaha]], who do I have the pleasure of speaking with?
+C: Hi, this is [[NAME:Harold Pemberton]].
+A: Nice to meet you [[NAME:Harold]]. Can I get your date of birth?
+C: Sure, it's [[DOB:March third nineteen forty eight]].
+A: And how old does that make you?
+C: I'm [[AGE:seventy eight years old]].
+A: Do you have any health conditions I should know about?
+C: I have [[HEALTH:type two diabetes]] and I take [[MEDICATION:metformin]] every day.
+A: Thank you. What's your social security number?
+C: It's [[SSN:nine two seven six one four four three two]].
+A: Let me read that back, [[SSN:nine two seven, six one, four four three two]].
+C: That's right.
+A: And your Medicare number from the red white and blue card?
+C: [[MBI:one E G four T E five M K seven three]].
+A: Who would you like as the beneficiary?
+C: My daughter, [[BENEFICIARY:Rebecca Pemberton]].
+A: What's the best phone number for you?
+C: [[PHONE:three one two five five five oh one nine eight]].
+A: And your mailing address?
+C: [[ADDRESS:fourteen twenty two Maple Grove Road]], [[CITY:Springfield]], [[ADDRESS:six two seven oh four]].
+A: For the payment, what's the card number?
+C: [[CARD:four one one one, one one one one, one one one one, one one one one]].
+A: Expiration and the three digits on the back?
+C: [[CARD_EXPIRY:oh nine twenty nine]], and [[CVV:one two three]].
+A: Your policy number will be [[POLICY:F E four four seven one nine two]]. Welcome aboard.

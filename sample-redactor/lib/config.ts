@@ -1,0 +1,71 @@
+// Every model and threshold the pipeline uses, in one place. Model ids are
+// PINNED: one exact id each, no fallback lists, no "latest" aliases. Changing
+// one is a pipeline change: bump PIPELINE_VERSION with it, so every result says
+// which pipeline produced it.
+
+export const PIPELINE_VERSION = "sr-1.0.0";
+
+export const MODELS = {
+  // AssemblyAI: transcription + word timestamps + entity detection. Exactly one model.
+  asr: process.env.ASSEMBLYAI_SPEECH_MODEL ?? "universal-3-5-pro",
+  // OpenRouter: labels only (PII entity labels on the raw transcript, clip labels
+  // and coaching on the redacted one). Never timestamps, never audio.
+  llm: process.env.OPENROUTER_MODEL ?? "google/gemini-2.5-flash",
+} as const;
+
+export const LIMITS = {
+  maxCallSeconds: 3600,            // calls up to 60 minutes
+  jobDeadlineMs: 2 * 60 * 60 * 1000, // 2 hours of processing per job
+  durationTolerance: 0.05,         // ±5% vs calls.duration
+  asrWaitMinutes: 90,              // per ASR pass, inside the job deadline
+} as const;
+
+export const BLEEP = {
+  toneHz: 1000,
+  dbfs: -12,
+  mergeGapMs: 500,
+  edgeFadeMs: 5,
+} as const;
+
+export const QA = {
+  minAvgWordConfidence: 0.85,
+  minSpanConfidence: 0.7,
+  maxCrosstalk: 0.1,
+} as const;
+
+export const DIGIT_RUN = { minDigits: 4, windowMs: 8000 } as const;
+
+export const HIGHLIGHT = { minS: 180, maxS: 480, fadeS: 1 } as const;
+
+export const PITCH_SEMITONES = -3;
+
+// Fixed clip labels: the only labels any result may carry.
+export const CLIP_LABELS = [
+  "opener",
+  "rapport",
+  "discovery",
+  "health_questions",
+  "presentation",
+  "quote",
+  "objection",
+  "close",
+  "application",
+  "wrap_up",
+  "other",
+] as const;
+export type ClipLabel = (typeof CLIP_LABELS)[number];
+
+export const COST = {
+  // USD per audio-hour per channel transcribed; TR's bridge sends the configured
+  // value (SAMPLE_ASR_USD_PER_HOUR) and this is only the local fallback.
+  asrUsdPerHourFallback: 0.45,
+  // Pre-flight allowance for one OpenRouter call; the actual usage.cost is recorded after.
+  llmCallReserveUsd: 0.1,
+  llmMaxOutputTokens: 8000,
+} as const;
+
+export function env(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`missing env ${name}`);
+  return v;
+}

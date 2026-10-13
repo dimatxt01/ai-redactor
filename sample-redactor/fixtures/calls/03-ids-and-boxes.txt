@@ -1,0 +1,14 @@
+# Alphanumeric IDs, NATO alphabet, P.O. box, apartment, written numerals.
+# meta: agent=Priya Natarajan; caller=Walter Osei
+A: Hi [[NAME:Walter]], it's [[NAME:Priya]] from the agency.
+C: Hi [[NAME:Priya]].
+A: I need the application number off your letter.
+C: It says [[POLICY:A P P seven seven three two one]].
+A: And your Medicare number?
+C: [[MBI:one Echo Golf four Tango Echo five Mike Kilo seven three]].
+A: Where do you get your mail?
+C: [[ADDRESS:P O box four four one two]], or [[ADDRESS:apartment seven]] at the senior center.
+A: And your birthday?
+C: [[DOB:July 4th 1950]].
+A: Perfect. And a backup number?
+C: [[PHONE:2175550143]].
