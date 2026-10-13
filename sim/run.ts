@@ -14,8 +14,9 @@
 //   npm run simulate -- --keep       # leave the servers running at the end (Ctrl-C to stop)
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { signBody } from "../lib/signature";
 import { CLIP_LABELS, NO_AUDIO_LABELS, PIPELINE_VERSION, SCHEMA_VERSION } from "../lib/config";
@@ -208,8 +209,13 @@ async function main() {
 
   // Postgres with the real migrations
   execFileSync(path.join(PGBIN, "initdb"), ["-D", PGDIR, "-U", "postgres", "-A", "trust"], { stdio: "ignore" });
-  execFileSync(path.join(PGBIN, "pg_ctl"), ["-D", PGDIR, "-o", `-p ${PORT.pg} -c listen_addresses=127.0.0.1 -k ${PGDIR}`, "-l", path.join(LOGS, "postgres.log"), "-w", "start"], { stdio: "ignore" });
-  process.on("exit", () => { try { execFileSync(path.join(PGBIN, "pg_ctl"), ["-D", PGDIR, "-m", "immediate", "stop"], { stdio: "ignore" }); } catch { /* stopped */ } });
+  // the Unix socket goes in a short temp dir: macOS caps socket paths at 103 bytes, and checkouts can be deep
+  const SOCK = mkdtempSync(path.join(tmpdir(), "srpg-"));
+  execFileSync(path.join(PGBIN, "pg_ctl"), ["-D", PGDIR, "-o", `-p ${PORT.pg} -c listen_addresses=127.0.0.1 -k ${SOCK}`, "-l", path.join(LOGS, "postgres.log"), "-w", "start"], { stdio: "ignore" });
+  process.on("exit", () => {
+    try { execFileSync(path.join(PGBIN, "pg_ctl"), ["-D", PGDIR, "-m", "immediate", "stop"], { stdio: "ignore" }); } catch { /* stopped */ }
+    rmSync(SOCK, { recursive: true, force: true });
+  });
   psql("", path.join(TR, "supabase/tests/training_library/_fixture.sql"));
   psql("", path.join(TR, "supabase/migrations/20261012180000_training_library.sql"));
   psql("", path.join(TR, "supabase/migrations/20261013090000_sample_redaction_worker.sql"));
