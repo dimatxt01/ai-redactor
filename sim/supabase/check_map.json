@@ -1,0 +1,6 @@
+{
+  "imports": {
+    "../../truering/supabase/functions/_shared/featureFlags.ts": "./stubs/featureFlags.ts",
+    "../../truering/supabase/functions/_shared/npaState.ts": "./stubs/npaState.ts"
+  }
+}

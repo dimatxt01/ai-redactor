@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "https://esm.sh/@supabase/supabase-js@2": "./fake-supabase.ts",
+    "../../truering/supabase/functions/_shared/featureFlags.ts": "./stubs/featureFlags.ts",
+    "../../truering/supabase/functions/_shared/npaState.ts": "./stubs/npaState.ts"
+  }
+}

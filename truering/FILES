@@ -1,0 +1,15 @@
+scripts/rollbacks/rollback_20261013090000_sample_redaction_worker.sql
+src/components/recording-library/QaPanel.tsx
+src/components/recording-library/QaPlayer.tsx
+src/components/recording-library/api.ts
+src/components/recording-library/types.ts
+src/components/recording-library/useListenCoverage.ts
+src/lib/recordingLibraryFlag.ts
+src/pages/admin/RecordingLibrary.tsx
+supabase/functions/_shared/sampleSignature.ts
+supabase/functions/_shared/telnyxRecording.ts
+supabase/functions/sample-redaction-bridge/index.ts
+supabase/functions/training-library-admin/index.ts
+supabase/migrations/20261013090000_sample_redaction_worker.sql
+supabase/tests/sample_redaction/run.sh
+supabase/tests/sample_redaction/test.sql
