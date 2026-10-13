@@ -3,7 +3,7 @@
 // one is a pipeline change: bump PIPELINE_VERSION with it, so every result says
 // which pipeline produced it.
 
-export const PIPELINE_VERSION = "sr-2.0.0";   // 2.0: SPEC v0.2 clip taxonomy, smart clips, fe_v1 coaching
+export const PIPELINE_VERSION = "sr-2.1.0";   // 2.0: SPEC v0.2 clip taxonomy, smart clips, fe_v1 coaching · 2.1: clip cap by length, clips repaired/dropped one by one, preferred LLM provider
 
 // Output schema (SPEC v0.2 §7): adding fields = minor, renaming/removing = major (30 days side by side).
 export const SCHEMA_VERSION = "1.0";

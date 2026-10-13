@@ -67,6 +67,7 @@ docker compose -f deploy/docker-compose.yml up -d --build    # restart: unless-s
 npm run simulate                  # the whole system on this machine, no keys, nothing live (~1.5 min)
 npm run validate -- --offline     # every check incl. the simulation; no vendor calls
 npm run validate                  # + the real-vendor eval if ASSEMBLYAI_API_KEY / OPENROUTER_API_KEY are set (~$1.60)
+npm run eval -- --llm-only        # re-check clip labels on the last run's cached redacted lines (cents, no ASR)
 bash truering/check.sh /path/to/truering   # read-only TrueRing-side checks inside a checkout of prb/rl-worker
 ```
 

@@ -132,3 +132,21 @@ The TrueRing side's source of truth is now `prb/rl-worker`; it merged #347/#349 
 - **New: AssemblyAI orphan sweep.** The new crash scenario showed it was needed: a worker killed between AssemblyAI's submit and the bridge `asr` record leaves a transcript whose id TR never learns. It would sit at the vendor forever, and it doesn't block a delete, since the row shows no ids. Every `ORPHAN_SWEEP_S` (1800) the worker lists its account's transcripts and deletes those older than `ORPHAN_AGE_S` (8100 = 2 h 15 m, past the 2 h job deadline), never touching ids of its own running jobs. This requires an AssemblyAI key used by this worker only. Tests: `test/assemblyai-list.test.ts`, plus a deterministic simulation case.
 - **Hosting.** `deploy/docker-compose.yml` (restart unless-stopped, read-only root, tmpfs `/tmp`, json-file log rotation) and `deploy/ai-redactor.service` (systemd, `Restart=always`, the self-check before every start). ffmpeg-static is per-architecture; `npm run check` runs on the host or inside the image.
 - **Proof.** `npm run simulate`, 102 checks: hard delete (admin only, rows and files gone, spend kept in the ledger, then `NO_JOB`); cancel mid-run → stop → `vendor_purged` → delete (refused while in flight); refusal of not-ended calls and of agents with two or no verticals; a Medicare call whose prompt names Medicare; the orphan sweep. TR-side checks (`truering/check.sh`) pass on `prb/rl-worker` @ 1ea55f37.
+
+## 2026-10-13: first real-vendor eval (AssemblyAI universal-3-5-pro, OpenRouter gemini-2.5-flash), and sr-2.1.0
+
+**Redaction passed on all 12 synthetic calls.** No planted value was audible in any redacted call or clip, none was left in a transcript or in coaching text, and the second pass found nothing.
+
+**Clip labeling failed on 6 calls, all of them labeling problems, none a privacy problem:**
+1. **11 (44 s): invented line ids.** The prompt allowed 6 clips of ≥20 s in a 44 s call, so the model invented ids to fill the quota, and the whole answer was rejected.
+2. **03, 12 (85% bleeped): no clip.** No window existed that didn't start or end inside a bleep.
+3. **05, 09, 10: labels unstable across 3 reruns,** with one label differing.
+
+**Fixed in sr-2.1.0:**
+- **Clip cap** (`clipCap`): one minimum-length clip per 20 s of audio, and the prompt says "never more".
+- **Repair, not reject** (`repairAnswer`): a bad clip is repaired (sub-label, confidence, scores, key lines) or dropped, with the reason recorded. The rest of the answer stands, and only call-level problems are retried.
+- **One preferred provider:** OpenRouter `provider.order = ["google-vertex"]` (fallbacks still allowed, ZDR still required). Reruns see the same model build.
+- **Eval rule narrowed:** a call may have no clip when it can hold at most one, or when every proposed window would start or end inside a bleep. My earlier "always ≥1 clip" was a heuristic of mine, not SPEC ("up to 6").
+- **`npm run eval -- --llm-only`:** re-checks labels on the cached redacted lines (`fixtures/out/<call>.lines.json`, gitignored) for cents.
+
+**Result on sr-2.1.0:** the five failing short calls (03, 05, 09, 11, 12) passed, stable across 3 reruns (09 now gives the same 6 labels every time), still with no leaks. Not yet rerun on sr-2.1.0: the 47-min call 10 (its own failure was one unstable label) and the six calls that already passed on sr-2.0.0.

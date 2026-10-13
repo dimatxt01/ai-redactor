@@ -2,8 +2,10 @@
 // transcript (the model never sees PII here). The model answers in utterance ids; times
 // come from AssemblyAI words via the utterances, and quotes are copied from the redacted
 // lines by id, so no output text can restore a bleeped value.
-// Deterministic: fixed taxonomy + rubric, temperature 0, seed; the answer is validated
-// (schema + rules) and retried ONCE with the error; still invalid => no clips, `labels_invalid`.
+// Deterministic: fixed taxonomy + rubric, temperature 0, seed, one preferred provider; the answer is
+// validated (schema + rules). A bad CLIP is repaired or dropped (`repairAnswer`, reasons recorded); a bad CALL
+// summary is retried ONCE with the error; still invalid => no clips, `labels_invalid`.
+// The clip count is capped by what the call can hold (one minimum-length clip per CLIPS.minS of audio).
 import { z } from "zod";
 import { CLIP_LABELS, CLIPS, NO_AUDIO_LABELS, OBJECTION_SUBLABELS, RUBRIC, VERTICALS, type ClipLabel, type Vertical } from "./config";
 import { llmJsonOnce } from "./openrouter";
@@ -41,7 +43,7 @@ type Answer = z.infer<typeof Schema>;
 
 const SYSTEM = (maxClips: number, vertical: Vertical) => `You coach ${VERTICALS[vertical]} insurance agents. This call ended in a Sale; you prepare it for an internal training library.
 Lines are "u<id> [mm:ss] SPEAKER: text". Personal details are already replaced by [REDACTED:TYPE]; never guess, restore or describe them.
-1. clips: up to ${maxClips} of the most teachable moments, in call order, each a contiguous from_u..to_u range of about ${CLIPS.minS}–${CLIPS.maxS} seconds.
+1. clips: up to ${maxClips} (never more; fewer is fine) of the most teachable moments, in call order, each a contiguous from_u..to_u range of about ${CLIPS.minS}–${CLIPS.maxS} seconds.
    label: one of ${CLIP_LABELS.join(", ")}. sub_label: for objection one of ${OBJECTION_SUBLABELS.join(", ")}; "none" for every other label.
    title: 3–8 words. did: what the agent did. worked: what worked. improve: one concrete improvement. key_line_ids: the ids of 1–2 key lines inside the clip.
    scores (rubric ${RUBRIC.id}, 1–5, null when the clip does not show that dimension): ${RUBRIC.dims.join(", ")}. confidence: 0–1 that the label is right.
@@ -98,6 +100,44 @@ export function validateAnswer(a: Answer, lines: RedactedLine[], maxClips: numbe
   score(a.call.scores, "call", false);
   if (a.clips.length && (a.call.turning_point_clip < 0 || a.call.turning_point_clip >= a.clips.length)) out.push("call.turning_point_clip: index into clips");
   return out;
+}
+
+/** How many minimum-length clips this call can hold (a 44 s call: 2; an 18 s call: 0), never above the config cap. */
+export function clipCap(durationMs: number, configured: number = CLIPS.maxPerCall): number {
+  return Math.max(0, Math.min(configured, CLIPS.maxPerCall, Math.floor(durationMs / (CLIPS.minS * 1000))));
+}
+
+/**
+ * Make an answer usable without trusting the model: clips with line ids that don't exist (or run backwards) are
+ * dropped; small slips are repaired (sub_label by label, confidence clamped, out-of-range clip scores → null, key
+ * lines limited to the clip's own existing lines); extra clips beyond `maxClips` are cut. Only call-level problems
+ * remain in `problems` (those are retried). Nothing is ever ADDED to model text, so no PII can come in this way.
+ */
+export function repairAnswer(a: Answer, lines: RedactedLine[], maxClips: number): { answer: Answer; dropped: string[]; problems: string[] } {
+  const ids = new Set(lines.map((l) => l.u));
+  const dropped: string[] = [];
+  const keptIdx: number[] = [];
+  const clips: Answer["clips"] = [];
+  a.clips.forEach((c, i) => {
+    if (clips.length >= maxClips) { dropped.push(`clip_over_cap:${c.label}`); return; }
+    if (!ids.has(c.from_u) || !ids.has(c.to_u) || c.to_u < c.from_u) { dropped.push(`clip_bad_ids:${c.label}`); return; }
+    const inClip = c.key_line_ids.filter((u) => ids.has(u) && u >= c.from_u && u <= c.to_u).slice(0, 2);
+    const fixScore = (v: number | null) => (v === null || (Number.isInteger(v) && v >= 1 && v <= 5) ? v : null);
+    clips.push({
+      ...c,
+      sub_label: c.label === "objection" ? (c.sub_label === "none" ? "other" : c.sub_label) : "none",
+      key_line_ids: inClip.length ? inClip : [c.from_u],
+      confidence: Math.min(1, Math.max(0, Number.isFinite(c.confidence) ? c.confidence : 0)),
+      scores: Object.fromEntries(RUBRIC.dims.map((d) => [d, fixScore(c.scores[d])])) as Answer["clips"][number]["scores"],
+    });
+    keptIdx.push(i);
+  });
+  // the turning point names an index in the ORIGINAL list; follow it to the kept clip, or drop the reference
+  const tp = keptIdx.indexOf(a.call.turning_point_clip);
+  const answer: Answer = { clips, call: { ...a.call, turning_point_clip: tp >= 0 ? tp : -1 } };
+  const problems = validateAnswer({ ...answer, call: { ...answer.call, turning_point_clip: Math.max(0, tp) } }, lines, maxClips)
+    .filter((p) => p.startsWith("call."));
+  return { answer, dropped, problems };
 }
 
 /**
@@ -201,7 +241,7 @@ export async function clipAndCoach(
   durationMs: number,
   opts: { maxClips?: number; vertical?: Vertical; onCost?: (usd: number, attempt: number) => Promise<void> } = {},
 ): Promise<ClipResult> {
-  const maxClips = Math.min(CLIPS.maxPerCall, opts.maxClips ?? CLIPS.maxPerCall);
+  const maxClips = clipCap(durationMs, opts.maxClips ?? CLIPS.maxPerCall);
   let costUsd = 0, model = "", error = "";
   for (let attempt = 1; attempt <= 2; attempt++) {
     const r = await llmJsonOnce({
@@ -213,10 +253,11 @@ export async function clipAndCoach(
     });
     costUsd += r.costUsd;
     model = r.model;
-    const problems = r.ok ? validateAnswer(r.data, lines, maxClips) : [r.error];
-    if (r.ok && !problems.length) {
-      const built = buildClips(r.data, lines, bleeps, durationMs, model);
-      return { ok: true, ...built, costUsd, model, attempts: attempt };
+    const fixed = r.ok ? repairAnswer(r.data, lines, maxClips) : null;
+    const problems = fixed ? fixed.problems : [r.ok ? "" : r.error];
+    if (fixed && !problems.length) {
+      const built = buildClips(fixed.answer, lines, bleeps, durationMs, model);
+      return { ok: true, ...built, dropped: [...fixed.dropped, ...built.dropped], costUsd, model, attempts: attempt };
     }
     error = problems.slice(0, 8).join("; ").slice(0, 600);
   }

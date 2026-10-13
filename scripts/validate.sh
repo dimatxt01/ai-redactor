@@ -194,7 +194,7 @@ elif [ -z "${ASSEMBLYAI_API_KEY:-}" ]; then
 else
   [ -z "${OPENROUTER_API_KEY:-}" ] && VENDOR_NOTE=" (OPENROUTER_API_KEY not set: model PII pass, clips + coaching skipped)"
   EVAL_ARGS=(); [ $SKIP_LONG = 1 ] && EVAL_ARGS+=(--skip-long)
-  step "vendors: real-audio leak eval$VENDOR_NOTE" "no planted value audible or in transcripts; clips valid + stable x3; no PII in coaching" npm run eval -- "${EVAL_ARGS[@]}"
+  step "vendors: real-audio leak eval$VENDOR_NOTE" "no planted value audible or in transcripts; clips valid + stable x3; no PII in coaching" npm run eval -- ${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}
 fi
 
 # ── report ────────────────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { bleepPcm } from "@/lib/audio";
 import { redactedLines, spansJson } from "@/lib/artifacts";
-import { buildClips, snapClip, validateAnswer, type RedactedLine } from "@/lib/labels";
+import { buildClips, clipCap, repairAnswer, snapClip, validateAnswer, type RedactedLine } from "@/lib/labels";
 import { safeValue } from "@/lib/log";
 import { bleepIntervals, ruleSpans } from "@/lib/pii/detect";
 import { clipReasons, secondPassReasons, textPiiReasons } from "@/lib/qa";
@@ -72,6 +72,40 @@ describe("smart clips (SPEC v0.2 §2.6)", () => {
     expect(validateAnswer(answer([{ scores: { ...scores, rapport: 7 } }]) as never, lines, 6).join()).toMatch(/rapport/);
     expect(validateAnswer(answer([{}], { strengths: ["a"] }) as never, lines, 6).join()).toMatch(/exactly 3/);
     expect(validateAnswer(answer([{}], { turning_point_clip: 3 }) as never, lines, 6).join()).toMatch(/turning_point/);
+  });
+  it("caps the clip count by what the call can hold (real eval: a 44 s call got 5 clips with invented line ids)", () => {
+    expect(clipCap(44_000)).toBe(2);
+    expect(clipCap(18_000)).toBe(0);
+    expect(clipCap(3_600_000)).toBe(6);
+    expect(clipCap(600_000, 3)).toBe(3);
+  });
+  it("repairs or drops a bad clip instead of throwing the whole answer away", () => {
+    const lines = L(30);
+    const a = answer([
+      {},                                                              // fine
+      { from_u: 40, to_u: 44 },                                        // ids that don't exist → dropped
+      { label: "objection", sub_label: "none", key_line_ids: [99], confidence: 3, scores: { ...scores, rapport: 9 } },
+      { label: "close", sub_label: "price" },
+    ], { turning_point_clip: 2 });
+    const r = repairAnswer(a as never, lines, 6);
+    expect(r.problems).toEqual([]);
+    expect(r.dropped).toEqual(["clip_bad_ids:opener"]);
+    expect(r.answer.clips).toHaveLength(3);
+    const obj = r.answer.clips[1];
+    expect(obj.sub_label).toBe("other");
+    expect(obj.key_line_ids).toEqual([obj.from_u]);
+    expect(obj.confidence).toBe(1);
+    expect(obj.scores.rapport).toBeNull();
+    expect(r.answer.clips[2].sub_label).toBe("none");
+    expect(r.answer.call.turning_point_clip).toBe(1);                  // followed to the kept clip
+    expect(validateAnswer(r.answer as never, lines, 6)).toEqual([]);   // the repaired answer is fully valid
+    // over the cap: the extra clips are cut; a turning point on a dropped clip becomes "none"
+    const capped = repairAnswer(answer([{}, {}, {}], { turning_point_clip: 2 }) as never, lines, 2);
+    expect(capped.answer.clips).toHaveLength(2);
+    expect(capped.dropped).toEqual(["clip_over_cap:opener"]);
+    expect(capped.answer.call.turning_point_clip).toBe(-1);
+    // call-level problems are not repaired: they are retried
+    expect(repairAnswer(answer([{}], { strengths: ["a"] }) as never, lines, 6).problems.join()).toMatch(/exactly 3/);
   });
   it("orders clips c1..cN by time, keeps application audio out, quotes only redacted lines", () => {
     const lines = L(60).map((l) => (l.u === 41 ? { ...l, text: "my date of birth is [REDACTED:DOB]" } : l));

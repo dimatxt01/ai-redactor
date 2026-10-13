@@ -43,7 +43,8 @@ export async function llmJsonOnce<S extends z.ZodType>(opts: LlmOpts<S>): Promis
         temperature: 0,
         seed: 7,   // deterministic labels where the provider supports it (SPEC v0.2 §7)
         max_tokens: COST.llmMaxOutputTokens,
-        provider: { zdr: true, data_collection: "deny", require_parameters: true },
+        // one preferred provider (Vertex) so reruns see the same model build; others only if it is down
+        provider: { zdr: true, data_collection: "deny", require_parameters: true, order: PROVIDER_ORDER, allow_fallbacks: true },
         response_format: {
           type: "json_schema",
           json_schema: { name: opts.schemaName, strict: true, schema: strictSchema(z.toJSONSchema(opts.schema)) },
@@ -81,6 +82,8 @@ export async function llmJsonOnce<S extends z.ZodType>(opts: LlmOpts<S>): Promis
   if (!ok.success) return { ok: false, error: ok.error.issues.slice(0, 5).map((i) => `${i.path.join(".")}: ${i.message}`).join("; "), costUsd, model };
   return { ok: true, data: ok.data, costUsd, model };
 }
+
+const PROVIDER_ORDER = (process.env.OPENROUTER_PROVIDER_ORDER ?? "google-vertex").split(",").map((x) => x.trim()).filter(Boolean);
 
 /** Strict-mode JSON schema: drop $schema and zod's safe-integer bounds, which some providers reject. */
 export function strictSchema(node: unknown): unknown {

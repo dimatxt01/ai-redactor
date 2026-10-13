@@ -6,6 +6,7 @@
 // and a leak report (SPEC v0.2 §7 CI target): every planted value's words under a bleep, none in the
 // redacted transcript, 0 second-pass hits, clip labels from the fixed set and stable across reruns.
 //   ASSEMBLYAI_API_KEY=… [OPENROUTER_API_KEY=…] npm run eval [-- 01-classic-sale …] [--reruns 3] [--skip-long]
+//   OPENROUTER_API_KEY=… npm run eval -- --llm-only [names…]   # clips + coaching again on the cached redacted lines (cents)
 // Writes fixtures/out/<name>.redacted.{mp3,txt}, <name>.clips/cN.mp3, <name>.{clips,coaching}.json and
 // eval-report.json. Deletes its AssemblyAI transcripts at the end.
 // The calls are synthetic; every value in them is fictional.
@@ -19,8 +20,8 @@ import { tokenize } from "../lib/pii/spoken";
 import { llmPiiSpans } from "../lib/pii/llm";
 import { clipReasons, secondPassReasons, textPiiReasons } from "../lib/qa";
 import { redactedLines, transcriptTxt } from "../lib/artifacts";
-import { clipAndCoach, type Clip, type CallCoaching } from "../lib/labels";
-import { CLIP_LABELS, CLIPS, MODELS, PIPELINE_VERSION, SCHEMA_VERSION } from "../lib/config";
+import { clipAndCoach, clipCap, type Clip, type CallCoaching } from "../lib/labels";
+import { CLIP_LABELS, MODELS, PIPELINE_VERSION, SCHEMA_VERSION } from "../lib/config";
 import { fromAssemblyAi, norm } from "../lib/words";
 import type { Planted } from "../fixtures/parse";
 
@@ -48,6 +49,66 @@ async function transcribe(file: string, multichannel: boolean, keyterms: string[
     if (t.status === "completed") return t;
     if (t.status === "error") throw new Error(`transcript error`);
   }
+}
+
+type Lines = ReturnType<typeof redactedLines>;
+
+/** Smart clips + coaching on the redacted transcript (the only LLM input in production), RERUNS times. */
+async function clipEval(name: string, lines: Lines, bleeps: ReturnType<typeof bleepIntervals>, durationMs: number,
+  names: string[], second: string[], redacted: string | null) {
+  let clipsReport: Record<string, unknown> = { skipped: true };
+  let clipFail = false;
+  if (!process.env.OPENROUTER_API_KEY || !lines.length) return { clipsReport, clipFail };
+  const runs: { ok: boolean; labels: string; clips: Clip[]; coaching: CallCoaching | null; cost: number; dropped: string[]; error?: string }[] = [];
+  for (let k = 0; k < RERUNS; k++) {
+    try {
+      const r = await clipAndCoach(lines, bleeps, durationMs);
+      runs.push(r.ok
+        ? { ok: true, labels: r.clips.map((c) => c.label + (c.sub_label ? `:${c.sub_label}` : "")).join(","), clips: r.clips, coaching: r.coaching, cost: r.costUsd, dropped: r.dropped }
+        : { ok: false, labels: "", clips: [], coaching: null, cost: r.costUsd, dropped: [], error: r.error.slice(0, 200) });
+    } catch (e) {
+      runs.push({ ok: false, labels: "", clips: [], coaching: null, cost: 0, dropped: [], error: e instanceof Error ? e.message.slice(0, 200) : "unknown" });
+    }
+  }
+  const first = runs.find((r) => r.ok);
+  const clipDir = path.join(OUT, `${name}.clips`);
+  mkdirSync(clipDir, { recursive: true });
+  if (redacted && existsSync(redacted)) for (const c of first?.clips ?? []) if (c.audio_exported) await cutClip(redacted, path.join(clipDir, `${c.clip_id}.mp3`), c, "eval");
+  writeFileSync(path.join(OUT, `${name}.clips.json`), JSON.stringify({ schema_version: SCHEMA_VERSION, pipeline_version: PIPELINE_VERSION, items: first?.clips ?? [] }, null, 1));
+  writeFileSync(path.join(OUT, `${name}.coaching.json`), JSON.stringify({ schema_version: SCHEMA_VERSION, pipeline_version: PIPELINE_VERSION, items: first?.coaching ?? null }, null, 1));
+  const texts: { where: string; text: string }[] = [];
+  for (const r of runs.filter((x) => x.ok)) {
+    if (r.coaching) [r.coaching.summary, ...r.coaching.strengths, ...r.coaching.improvements].forEach((text, n) => texts.push({ where: `call.${n}`, text }));
+    for (const c of r.clips) [c.title, c.coaching.did, c.coaching.worked, c.coaching.improve, ...c.coaching.key_lines].forEach((text, n) => texts.push({ where: `${c.clip_id}.${n}`, text }));
+  }
+  const labelSet = new Set(runs.filter((r) => r.ok).map((r) => r.labels));
+  // no clip is right when the call can't hold one: shorter than the minimum, or every proposed window would start or
+  // end inside a bleep (12: 85% bleeped); any call that can hold two or more must yield at least one
+  // or the call holds at most one clip and the model (with an otherwise valid answer) found nothing worth cutting (03)
+  const noRoom = clipCap(durationMs) <= 1
+    || (!!first && first.clips.length === 0 && first.dropped.length > 0 && first.dropped.every((d) => d.startsWith("clip_no_valid_window")));
+  const labelsOk = runs.every((r) => r.ok) && runs.every((r) => r.clips.every((c) => (CLIP_LABELS as readonly string[]).includes(c.label)))
+    && ((first?.clips.length ?? 0) > 0 || noRoom);
+  const coachingPii = textPiiReasons(texts, names);
+  const clipHits = clipReasons(second, first?.clips ?? []);
+  clipFail = !labelsOk || labelSet.size > 1 || coachingPii.length > 0;
+  clipsReport = {
+    runs: runs.length,
+    valid_runs: runs.filter((r) => r.ok).length,
+    errors: runs.filter((r) => !r.ok).map((r) => r.error),
+    clips: first?.clips.length ?? 0,
+    exported: first?.clips.filter((c) => c.audio_exported).length ?? 0,
+    labels: first?.labels ?? "",
+    labels_ok: labelsOk,
+    no_room_for_a_clip: noRoom,
+    stable_across_runs: labelSet.size <= 1,
+    label_variants: [...labelSet],
+    dropped: [...new Set(runs.flatMap((r) => r.dropped))],
+    coaching_pii: coachingPii,
+    clip_second_pass: clipHits,
+    cost_usd: Math.round(runs.reduce((n, r) => n + r.cost, 0) * 10000) / 10000,
+  };
+  return { clipsReport, clipFail };
 }
 
 async function evalCall(name: string) {
@@ -119,54 +180,9 @@ async function evalCall(name: string) {
       }
     }
 
-    // smart clips + coaching on the redacted transcript (the only LLM input in production), RERUNS times
-    let clipsReport: Record<string, unknown> = { skipped: true };
-    let clipFail = false;
-    if (process.env.OPENROUTER_API_KEY && lines.length) {
-      const runs: { ok: boolean; labels: string; clips: Clip[]; coaching: CallCoaching | null; cost: number; error?: string }[] = [];
-      for (let k = 0; k < RERUNS; k++) {
-        try {
-          const r = await clipAndCoach(lines, bleeps, durationMs);
-          runs.push(r.ok
-            ? { ok: true, labels: r.clips.map((c) => c.label + (c.sub_label ? `:${c.sub_label}` : "")).join(","), clips: r.clips, coaching: r.coaching, cost: r.costUsd }
-            : { ok: false, labels: "", clips: [], coaching: null, cost: r.costUsd, error: r.error.slice(0, 200) });
-        } catch (e) {
-          runs.push({ ok: false, labels: "", clips: [], coaching: null, cost: 0, error: e instanceof Error ? e.message.slice(0, 200) : "unknown" });
-        }
-      }
-      const first = runs.find((r) => r.ok);
-      const clipDir = path.join(OUT, `${name}.clips`);
-      mkdirSync(clipDir, { recursive: true });
-      for (const c of first?.clips ?? []) if (c.audio_exported) await cutClip(redacted, path.join(clipDir, `${c.clip_id}.mp3`), c, "eval");
-      writeFileSync(path.join(OUT, `${name}.clips.json`), JSON.stringify({ schema_version: SCHEMA_VERSION, pipeline_version: PIPELINE_VERSION, items: first?.clips ?? [] }, null, 1));
-      writeFileSync(path.join(OUT, `${name}.coaching.json`), JSON.stringify({ schema_version: SCHEMA_VERSION, pipeline_version: PIPELINE_VERSION, items: first?.coaching ?? null }, null, 1));
-      const texts: { where: string; text: string }[] = [];
-      for (const r of runs.filter((x) => x.ok)) {
-        if (r.coaching) [r.coaching.summary, ...r.coaching.strengths, ...r.coaching.improvements].forEach((text, n) => texts.push({ where: `call.${n}`, text }));
-        for (const c of r.clips) [c.title, c.coaching.did, c.coaching.worked, c.coaching.improve, ...c.coaching.key_lines].forEach((text, n) => texts.push({ where: `${c.clip_id}.${n}`, text }));
-      }
-      const labelSet = new Set(runs.filter((r) => r.ok).map((r) => r.labels));
-      const labelsOk = runs.every((r) => r.ok) && runs.every((r) => r.clips.every((c) => (CLIP_LABELS as readonly string[]).includes(c.label))) 
-        // a call shorter than the minimum clip length (04: 18 s) can have no clip; any longer call must have one
-        && ((first?.clips.length ?? 0) > 0 || durationMs < CLIPS.minS * 1000);
-      const coachingPii = textPiiReasons(texts, names);
-      const clipHits = clipReasons(second, first?.clips ?? []);
-      clipFail = !labelsOk || labelSet.size > 1 || coachingPii.length > 0;
-      clipsReport = {
-        runs: runs.length,
-        valid_runs: runs.filter((r) => r.ok).length,
-        errors: runs.filter((r) => !r.ok).map((r) => r.error),
-        clips: first?.clips.length ?? 0,
-        exported: first?.clips.filter((c) => c.audio_exported).length ?? 0,
-        labels: first?.labels ?? "",
-        labels_ok: labelsOk,
-        stable_across_runs: labelSet.size <= 1,
-        label_variants: [...labelSet],
-        coaching_pii: coachingPii,
-        clip_second_pass: clipHits,
-        cost_usd: Math.round(runs.reduce((n, r) => n + r.cost, 0) * 10000) / 10000,
-      };
-    }
+    // cache what the LLM sees (redacted lines only), so `--llm-only` can re-check labels without paying for ASR again
+    writeFileSync(path.join(OUT, `${name}.lines.json`), JSON.stringify({ lines, bleeps, durationMs, names, second }));
+    const { clipsReport, clipFail } = await clipEval(name, lines, bleeps, durationMs, names, second, redacted);
 
     const report = {
       call: name,
@@ -193,11 +209,14 @@ async function evalCall(name: string) {
   }
 }
 
-if (!process.env.ASSEMBLYAI_API_KEY) {
+const argv = process.argv.slice(2);
+// --llm-only: re-check clips + coaching on the cached redacted lines of the last full run (no ASR cost)
+const LLM_ONLY = argv.includes("--llm-only");
+if (!LLM_ONLY && !process.env.ASSEMBLYAI_API_KEY) {
   console.error("set ASSEMBLYAI_API_KEY (and optionally OPENROUTER_API_KEY)");
   process.exit(2);
 }
-const argv = process.argv.slice(2);
+if (LLM_ONLY && !process.env.OPENROUTER_API_KEY) { console.error("--llm-only needs OPENROUTER_API_KEY"); process.exit(2); }
 const flag = (k: string) => { const i = argv.indexOf(k); return i >= 0 ? argv.splice(i, 2)[1] : undefined; };
 const RERUNS = Math.max(1, Math.min(5, Number(flag("--reruns") ?? process.env.EVAL_RERUNS ?? 3) || 3));
 const skipLong = argv.includes("--skip-long");
@@ -207,6 +226,22 @@ const names = readdirSync(OUT).filter((f) => /^\d\d-.*\.planted\.json$/.test(f))
   .filter((n) => !only.length || only.includes(n)).filter((n) => !(skipLong && n.includes("long-call")));
 let failed = 0;
 const reports: (Report | { call: string; error: string })[] = [];
+if (LLM_ONLY) {
+  const llmReports: Record<string, unknown>[] = [];
+  for (const n of names) {
+    const f = path.join(OUT, `${n}.lines.json`);
+    if (!existsSync(f)) { console.error(`no cached lines for ${n}: run a full eval first`); process.exit(2); }
+    const c = JSON.parse(readFileSync(f, "utf8"));
+    const { clipsReport, clipFail } = await clipEval(n, c.lines, c.bleeps, c.durationMs, c.names, c.second, path.join(OUT, `${n}.redacted.mp3`));
+    if (clipFail) failed++;
+    llmReports.push({ call: n, duration_min: Math.round(c.durationMs / 6000) / 10, clips: clipsReport, clip_fail: clipFail });
+    console.log(JSON.stringify(llmReports[llmReports.length - 1]));
+  }
+  const summary = `${new Date().toISOString()} ${PIPELINE_VERSION} llm=${MODELS.llm} (llm-only, cached redacted lines) · ${names.length} calls, ${failed} failed (invalid/unstable labels or PII in coaching) · reruns ${RERUNS}`;
+  writeFileSync(path.join(OUT, "eval-report-llm.json"), JSON.stringify({ summary, reports: llmReports }, null, 1));
+  console.log(`\n${summary}`);
+  process.exit(failed ? 1 : 0);
+}
 for (const n of names) {
   if (!existsSync(path.join(OUT, `${n}.mp3`))) { console.error(`missing ${n}.mp3 — run npm run make-test-calls`); process.exit(2); }
   try {
