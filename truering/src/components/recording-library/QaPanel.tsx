@@ -32,7 +32,7 @@ export function QaPanel({ call, job, source, onChanged, onDelete }: {
   job: JobRow | undefined;
   source: CallSource | undefined;
   onChanged: () => void;
-  onDelete: (callId: string) => void;
+  onDelete?: (callId: string) => void;   // admin | superadmin only; absent on the AM portal
 }) {
   const { toast } = useToast();
   const [clips, setClips] = useState<Clip[]>([]);
@@ -67,7 +67,7 @@ export function QaPanel({ call, job, source, onChanged, onDelete }: {
   const allClipsHeard = exported.every((c) => (clipCoverage[c.id] ?? 0) >= FULL);
   const canTick = fullCoverage >= FULL && allClipsHeard;
   const latest = reviews[0];
-  const editable = call.status !== "published" && !job?.delete_requested_at;
+  const editable = call.status !== "published";
   const onFullCoverage = useCallback((v: number) => setFullCoverage(v), []);
   const clipCoverageSetters = useMemo(
     () => Object.fromEntries(clips.map((c) => [c.id, (v: number) => setClipCoverage((m) => (m[c.id] === v ? m : { ...m, [c.id]: v }))])),
@@ -105,7 +105,7 @@ export function QaPanel({ call, job, source, onChanged, onDelete }: {
         <Badge variant="outline">{formatDuration(call.duration_s)}</Badge>
         <Badge variant={call.status === "published" ? "default" : call.status === "rejected" ? "destructive" : "secondary"}>{call.status}</Badge>
         <Badge variant={job?.qa_flag ? "destructive" : "secondary"}>{job?.qa_flag ? `${job.qa_reasons.length} QA flags` : "no QA flags"}</Badge>
-        {source?.consent_id ? <Badge variant="outline">consent on file</Badge> : <Badge variant="destructive">no consent</Badge>}
+        <Badge variant="outline">{call.vertical}</Badge>
       </div>
 
       {call.audio_path ? (
@@ -192,9 +192,9 @@ export function QaPanel({ call, job, source, onChanged, onDelete }: {
           {call.status !== "withdrawn" && (
             <Button size="sm" variant="outline" disabled={busy} onClick={() => act({ action: "withdraw", library_call_id: call.id, notes: notes || null }, "Withdrawn")}>Withdraw</Button>
           )}
-          {source && (
+          {source && onDelete && (
             <Button size="sm" variant="destructive" disabled={busy} onClick={() => onDelete(source.call_id)}>
-              <Trash2 className="mr-1 h-3 w-3" />{job?.delete_requested_at && !job?.deleted_at ? "Re-run delete" : "Delete every copy"}
+              <Trash2 className="mr-1 h-3 w-3" />Delete
             </Button>
           )}
         </div>

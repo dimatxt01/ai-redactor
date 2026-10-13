@@ -1,8 +1,8 @@
 // Sample-library spec §4: HMAC-SHA256 between TR and the ai-redactor worker.
 //   X-TR-Signature: t=<unix>,v1=<hex(hmac(secret, t + "." + raw_body))>
-// Replay window ±300s. Each direction has its own secret:
-//   SAMPLE_REDACTOR_START_SECRET   TR → worker (sample-library-admin starts a job)
+// Replay window ±300s. Pull model: TR never calls the worker, so the only secret is
 //   SAMPLE_REDACTOR_BRIDGE_SECRET  worker → TR (sample-redaction-bridge)
+// (signSampleBody stays for the parity check and the simulation.)
 // A missing secret REJECTS (never fail-open). The worker has a byte-identical
 // Node copy in the ai-redactor repo, lib/signature.ts (its scripts/signature-parity.ts checks both agree).
 

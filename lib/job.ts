@@ -5,7 +5,7 @@
 // Exactly once: the bridge's claim lets one run own a job; a run that loses the claim returns at once.
 // Any failure ends the job with an error code; TR's bridge purges scratch + partial artifacts. Every ending
 // deletes this run's AssemblyAI copies and reports them (`vendor_purged`), which also ends the heartbeat.
-// `signal` aborts the job: reason "stop" (taken down / failed elsewhere: nothing to record) or "shutdown"
+// `signal` aborts the job: reason "stop" (cancelled / failed / deleted elsewhere: nothing to record) or "shutdown"
 // (the worker is restarting: the job fails as internal, the AM retries).
 import { vendorPurged } from "./bridge";
 import { LIMITS, MODELS, PIPELINE_VERSION } from "./config";
@@ -21,9 +21,9 @@ const ASR_POLL_MS = (Number(process.env.ASR_POLL_S) || 10) * 1000;
 
 export type JobResult = { status: "done"; qa_flag: boolean } | { status: "duplicate" | "stopped" } | { status: "failed"; error_code: string };
 
-export async function runJob(jobId: string, idempotencyKey: string, runId: string, signal: AbortSignal): Promise<JobResult> {
-  const asrIds: string[] = [];
+export async function runJob(jobId: string, idempotencyKey: string, runId: string, signal: AbortSignal, asrIds: string[] = []): Promise<JobResult> {
   let claimed = false;
+  let gone = false;   // the job row no longer exists (NO_JOB)
   const step = <T>(fn: (attempt: number) => Promise<T>) => withRetry(fn, { signal });
 
   const transcribe = async (ctx: Ctx, pass: "pass1" | "pass2", durationMs: number): Promise<string> => {
@@ -97,19 +97,22 @@ export async function runJob(jobId: string, idempotencyKey: string, runId: strin
   } catch (e) {
     const msg = e instanceof Error ? e.message : "";
     if (msg.startsWith("DUPLICATE_RUN")) return { status: "duplicate" };
-    // ended elsewhere (takedown, 2 h deadline, month cap, failed by the bridge): nothing to record
-    const stopped = msg.startsWith("JOB_TERMINAL") || (signal.aborted && signal.reason === "stop");
+    // the call was deleted on TR's side: the row is gone; nothing to record or report
+    if (msg.startsWith("NO_JOB")) gone = true;
+    // ended elsewhere (cancelled, 2 h deadline, month cap, failed by the bridge, deleted): nothing to record
+    const stopped = gone || msg.startsWith("JOB_TERMINAL") || (signal.aborted && signal.reason === "stop");
     const { code, detail } = signal.aborted && signal.reason === "shutdown"
       ? { code: "internal", detail: "worker restarted; retry the job" }
       : codeFromError(e);
     if (claimed && !stopped) await failJob(jobId, runId, code, detail);
-    if (claimed) await purgeJobs([jobId]);
+    if (claimed && !gone) await purgeJobs([jobId]);
     return stopped ? { status: "stopped" } : { status: "failed", error_code: code };
   } finally {
     if (claimed) {
-      const { deleted } = await purgeAsr(asrIds);
-      // the last word of this run: vendor copies gone (a takedown completes here) and the heartbeat ends
-      try {
+      const { deleted } = await purgeAsr(asrIds);   // always: AssemblyAI keeps nothing, whatever happened to the row
+      // the last word of this run: vendor copies gone and the heartbeat ends (that is what lets TR delete the call).
+      // A row that is gone (NO_JOB) has nobody to tell.
+      if (!gone) try {
         await withRetry(() => vendorPurged(jobId, runId, deleted), { attempts: 3 });
       } catch {
         log("vendor_report_failed", { job_id: jobId });   // the bridge's cleanup list hands it out again once the heartbeat is stale

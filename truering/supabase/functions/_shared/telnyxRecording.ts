@@ -21,12 +21,13 @@ function recordingIdFromUrl(url: string): string | null {
   }
 }
 
-async function getJson(url: string, apiKey: string): Promise<any | null> {
+type TelnyxRecording = { download_urls?: { mp3?: string } };
+async function getJson<T>(url: string, apiKey: string): Promise<T | null> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), BUDGET_MS);
   try {
     const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: ctl.signal });
-    return res.ok ? await res.json() : null;
+    return res.ok ? ((await res.json()) as T) : null;
   } catch {
     return null;
   } finally {
@@ -44,12 +45,12 @@ export async function freshTelnyxRecordingUrl(
 
   const recordingId = recordingIdFromUrl(storedUrl);
   if (recordingId) {
-    const j = await getJson(`https://api.telnyx.com/v2/recordings/${recordingId}`, apiKey);
+    const j = await getJson<{ data?: TelnyxRecording }>(`https://api.telnyx.com/v2/recordings/${recordingId}`, apiKey);
     const url = j?.data?.download_urls?.mp3;
     if (url) return url;
   }
   if (callControlId) {
-    const j = await getJson(
+    const j = await getJson<{ data?: TelnyxRecording[] }>(
       `https://api.telnyx.com/v2/recordings?filter[call_control_id]=${encodeURIComponent(callControlId)}`,
       apiKey,
     );

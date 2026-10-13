@@ -5,7 +5,7 @@
 // Deterministic: fixed taxonomy + rubric, temperature 0, seed; the answer is validated
 // (schema + rules) and retried ONCE with the error; still invalid => no clips, `labels_invalid`.
 import { z } from "zod";
-import { CLIP_LABELS, CLIPS, NO_AUDIO_LABELS, OBJECTION_SUBLABELS, RUBRIC, type ClipLabel } from "./config";
+import { CLIP_LABELS, CLIPS, NO_AUDIO_LABELS, OBJECTION_SUBLABELS, RUBRIC, VERTICALS, type ClipLabel, type Vertical } from "./config";
 import { llmJsonOnce } from "./openrouter";
 import type { Interval } from "./pii/detect";
 
@@ -39,7 +39,7 @@ const Schema = z.object({
 });
 type Answer = z.infer<typeof Schema>;
 
-const SYSTEM = (maxClips: number) => `You coach final-expense insurance agents. This call ended in a Sale; you prepare it for an internal training library.
+const SYSTEM = (maxClips: number, vertical: Vertical) => `You coach ${VERTICALS[vertical]} insurance agents. This call ended in a Sale; you prepare it for an internal training library.
 Lines are "u<id> [mm:ss] SPEAKER: text". Personal details are already replaced by [REDACTED:TYPE]; never guess, restore or describe them.
 1. clips: up to ${maxClips} of the most teachable moments, in call order, each a contiguous from_u..to_u range of about ${CLIPS.minS}–${CLIPS.maxS} seconds.
    label: one of ${CLIP_LABELS.join(", ")}. sub_label: for objection one of ${OBJECTION_SUBLABELS.join(", ")}; "none" for every other label.
@@ -199,7 +199,7 @@ export async function clipAndCoach(
   lines: RedactedLine[],
   bleeps: Interval[],
   durationMs: number,
-  opts: { maxClips?: number; onCost?: (usd: number, attempt: number) => Promise<void> } = {},
+  opts: { maxClips?: number; vertical?: Vertical; onCost?: (usd: number, attempt: number) => Promise<void> } = {},
 ): Promise<ClipResult> {
   const maxClips = Math.min(CLIPS.maxPerCall, opts.maxClips ?? CLIPS.maxPerCall);
   let costUsd = 0, model = "", error = "";
@@ -207,7 +207,7 @@ export async function clipAndCoach(
     const r = await llmJsonOnce({
       schemaName: "call_clips_coaching",
       schema: Schema,
-      system: SYSTEM(maxClips),
+      system: SYSTEM(maxClips, opts.vertical ?? "final_expense"),
       user: fmtLines(lines) + (attempt > 1 ? `\n\nYour previous answer was invalid: ${error}. Answer again, fixing exactly these problems.` : ""),
       onCost: opts.onCost ? (usd) => opts.onCost!(usd, attempt) : undefined,
     });

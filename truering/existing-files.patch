@@ -1,5 +1,5 @@
 diff --git a/FLAGS.md b/FLAGS.md
-index 5c42c476..5f9d8b31 100644
+index 5c42c476..477f7ec8 100644
 --- a/FLAGS.md
 +++ b/FLAGS.md
 @@ -2703,3 +2703,12 @@ Silence (either mode → today, next webhook, cache ≤ 10 s): `update feature_f
@@ -8,7 +8,7 @@ index 5c42c476..5f9d8b31 100644
  > Note 2026-10-13 (§ unified_login / WL M0b): `my_workspaces()` parity migration `20261013050000_my_workspaces_portal_parity.sql` STAGED, NOT applied — admin/superadmin ⇒ admin + am workspaces. No flag row change. See BUGLOG 2026-10-13 ~05:00Z.
 +
 +## §76 — `recording_library` — internal training Recording Library (added 2026-10-12 by RL-1 / TRU-248, migration `20261012180000_training_library.sql` APPLIED 2026-10-13 01:21Z — row present, **OFF** `{}`; readers STAGED on branch `feat/sample-redaction`, NOT deployed)
-+**Why:** SPEC v0.2 / TR_PLAN: AMs and admins submit Final Expense Sale calls to the in-house redaction worker (separate repo `ai-redactor`, a background process that polls `sample-redaction-bridge`) and QA the redacted call, smart clips and coaching before anything is published to agents.
++**Why:** SPEC v0.2 / TR_PLAN: AMs and admins submit ended Sale calls of every vertical (final_expense, medicare, aca; no consent requirement, Dmitry 2026-10-13 12:44 PM) to the in-house redaction worker (separate repo `ai-redactor`, a background process in one container that polls `sample-redaction-bridge`) and QA the redacted call, smart clips and coaching before anything is published to agents.
 +**Readers (this branch):** `training-library-admin` refuses `submit` while OFF (`FLAG_OFF`; retry/review/publish/withdraw/delete keep working so in-flight items can be finished or taken down); the frontend hides the "Recording Library" nav in `/admin` and `/am` and shows a switched-off notice (`src/lib/recordingLibraryFlag.ts`, 60 s cache, unreadable = OFF). Agents see nothing until RL-7 ships, flag or not.
 +**Signal:** `select status, count(*), sum(cost_usd) from sample_redaction_jobs where created_at > date_trunc('month', now()) group by 1;` and `select count(*) from security_activity_log where event_type = 'sample_cost_cap_blocked' and created_at > now() - interval '1 day';` (ops-alert key `sample_cost_cap`).
 +**Scale:** staff-only page; at most one worker run per submit; spend capped at $2/job and $100/month (`SAMPLE_JOB_CAP_USD`, `SAMPLE_MONTH_CAP_USD`).
@@ -16,126 +16,43 @@ index 5c42c476..5f9d8b31 100644
 +Silence: `update feature_flags set enabled = false where key = 'recording_library';` (submit refused from the next request; nav hidden within 60 s).
 +**Manifest:** RL-1 (2026-10-12.1) put the flag in `flags.known_optional`; 2026-10-12.3 adds the triggers `sample_redaction_jobs_service_columns` and `sample_redaction_takedown_guard`.
 diff --git a/docs/recording-library/SPEC.md b/docs/recording-library/SPEC.md
-index 9bacdd6c..b7bd756f 100644
+index 9bacdd6c..d3019291 100644
 --- a/docs/recording-library/SPEC.md
 +++ b/docs/recording-library/SPEC.md
-@@ -1,7 +1,9 @@
--# True Ring: Recording Redaction + Coaching Service, spec v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers)
-+# True Ring: Recording Redaction + Coaching Service, spec v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers; delivery revised 2026-10-13: pull through the bridge, no callback)
+@@ -1,7 +1,7 @@
+ # True Ring: Recording Redaction + Coaching Service, spec v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers)
  
 -This is an external service that Dmitry builds separately (n8n plus models via OpenRouter or a speech API). True Ring (TR) sends it calls privately; it returns PII-bleeped audio and transcripts; TR AMs/admins pick sales calls and, after a human QA listen, publish the results to an internal **training** Recording Library (smart clips of the key sale moments plus AI coaching notes).
 -Status: draft. Based on read-only prod/repo scoping on 2026-10-12. Nothing built.
-+This is a separate service, the `ai-redactor` worker: its own repo, a plain Node background process in one container, with ffmpeg, AssemblyAI for speech and OpenRouter for text. It opens no port. True Ring (TR) queues a job per call; the worker **polls** for it and pulls the call's inputs and pushes its results **through one TR edge function, `sample-redaction-bridge`**, straight into TR's storage and tables. TR AMs/admins pick sales calls and, after a human QA listen, publish the results to an internal **training** Recording Library (smart clips of the key sale moments plus AI coaching notes).
-+Status: built (worker + TR side on branch `feat/sample-redaction`), not deployed. TR_PLAN.md RL-2/RL-3 describe the TR side.
-+
-+**The service is input/output only.** It has no database, tables, buckets or Supabase key. Every recording, clip, transcript and coaching note is stored on TR's side (RL-1 buckets and tables). Its temp files and AssemblyAI's copies are deleted every run; OpenRouter keeps nothing (zero data retention, no training). It keeps no state between jobs; its logs carry ids, hashes and counts, never content (§4).
++This is an external service that Dmitry builds separately (dimatxt01/ai-redactor: a plain Node background worker in one container, with ffmpeg, AssemblyAI and OpenRouter text models; it opens no port, polls TR's `sample-redaction-bridge` for work and returns results through it, no callback). True Ring (TR) sends it calls privately; it returns PII-bleeped audio and transcripts; TR AMs/admins pick sales calls and, after a human QA listen, publish the results to an internal **training** Recording Library (smart clips of the key sale moments plus AI coaching notes).
++Status: draft. **2026-10-13: return path is PULL via `sample-redaction-bridge` (no signed callback), see §3/§4.** Based on read-only prod/repo scoping on 2026-10-12. SPEC is design. TR-side code is *in `prb/rl-worker` (PR #347), not on main, not deployed* (pull model, ai-redactor f282201); nothing on main, nothing in prod.
  
  ## 1. Input contract (from real data)
  
-@@ -23,48 +25,47 @@ Audio:
- - Sample rate and bitrate: **unknown/verify**. The latest URL had already expired when probed, so no headers could be read. Expect 8 kHz telephony audio.
- 
- Fetching:
--- TR never sends a stored URL as-is.
--- Before submitting, TR gets a fresh link from Telnyx, the same way `recording-proxy` / `_shared/recordingUrl.ts` do.
--- Preferred: copy the file into a private TR bucket (`sample-src/`) and send a **Supabase signed URL, valid 15 min**.
--- The service must download it right away and must not store the URL.
-+- TR never sends a stored URL, and nothing is copied in advance.
-+- When the worker reaches its fetch step it asks the bridge (`source`) for a **fresh Telnyx link**, the same lookup `recording-proxy` does, and downloads it at once. It never stores the URL. A new link is fetched on every attempt (they expire in ~10 min).
-+- Twilio-era recordings are out of v1 (`unsupported_source`).
- 
--Sample submit payload:
-+Start: TR `training-library-admin` only writes the job row (`sample_job_insert`: the key, options, call meta, the reserved cost; status `queued`). TR never calls the worker. Within one poll interval (~20 s) the worker's `poll` returns it (ids only):
-+```json
-+{ "jobs": [{ "job_id": "6e1e1645-67cc-4cb1-9a0e-2c1f0d6f9e11", "idempotency_key": "call:2948f3a3-d352-4e3b-8976-1af6b7fb0230:v1" }], "stop": [], "cleanup": [], "lost": 0 }
-+```
-+The worker claims it and then pulls the job's inputs from the bridge (`job`):
- ```json
- {
--  "job_id": "srj_01J…",
--  "idempotency_key": "call:2948f3a3-d352-4e3b-8976-1af6b7fb0230:v1",
--  "call": {
--    "id": "2948f3a3-d352-4e3b-8976-1af6b7fb0230",
--    "duration_s": 764,
--    "disposition": "Sale",
--    "agent_ref": "agent_7",
--    "vertical": "final_expense",
--    "recorded_at": "2026-10-12T22:44:01Z"
--  },
--  "audio": {
--    "url": "https://<project>.supabase.co/storage/v1/object/sign/sample-src/…?token=…",
--    "expires_at": "2026-10-12T23:10:00Z",
--    "format": "mp3",
--    "channels": 2,
--    "channel_map": { "customer": 0, "agent": 1 }
--  },
--  "options": {
--    "bleep_pad_ms": 250,
--    "pitch_shift_customer": false,
--    "clips": { "enabled": true, "max_per_call": 6, "min_s": 20, "max_s": 240 },
--    "coaching": { "enabled": true, "rubric": "fe_v1" },
--    "extra_terms": ["<agent first/last name>", "<carrier names>"]
-+  "job": {
-+    "id": "6e1e1645-…", "call_id": "2948f3a3-…", "version": 1, "status": "queued",
-+    "options": {
-+      "bleep_pad_ms": 250,
-+      "pitch_shift_customer": false,
-+      "redact_health": true,
-+      "clips": { "enabled": true, "max_per_call": 6, "min_s": 20, "max_s": 240 },
-+      "coaching": { "enabled": true, "rubric": "fe_v1" },
-+      "extra_terms": ["<carrier names the AM added>"],
-+      "customer_channel": 0
-+    },
-+    "call_meta": {
-+      "duration_s": 764, "disposition": "Sale", "vertical": "final_expense", "caller_state": "TX",
-+      "recorded_at": "2026-10-12T22:44:01Z",
-+      "channel_map": { "customer": 0, "agent": 1, "verified": false }
-+    }
+@@ -55,7 +55,7 @@ Sample submit payload:
+     "coaching": { "enabled": true, "rubric": "fe_v1" },
+     "extra_terms": ["<agent first/last name>", "<carrier names>"]
    },
 -  "callback_url": "https://<project>.supabase.co/functions/v1/sample-redaction-callback"
-+  "extra_terms": ["<agent first/last name>", "<caller first/last name>", "<carrier names the AM added>"],
-+  "idempotency_key": "call:2948f3a3-…:v1",
-+  "caps": { "job_usd": 2, "month_usd": 100, "spent_usd": 0, "asr_usd_per_hour": 0.45 }
++  "bridge": "the worker reads this job and writes results only via sample-redaction-bridge (§4); there is no callback_url"
  }
  ```
--- `agent_ref` is a pseudonym. The service never receives agent names except in `extra_terms`, which are the terms to bleep.
--- `channel_map` stays "verify" until the pilot has confirmed it.
-+- Top-level `extra_terms` = the agent's and caller's names, read from TR rows at request time and never stored on the job, plus the AM's own terms from `options`.
-+- `channel_map` stays `verified:false` until the pilot has confirmed it; every result is QA-flagged `channel_map_unverified` until then.
-+- Missing or malformed options fall back to the defaults above; redaction settings fail safe.
- 
- ## 2. Processing
- 
- 1. Download the audio, check the duration against `duration_s` (±5%), and split it into its two channels.
--2. **Transcribe** each channel with **word-level timestamps** and diarization by channel. Options: AssemblyAI (with built-in PII audio redaction), Deepgram Nova (`redact=pii,numbers`), or AWS Transcribe Call Analytics. An LLM via OpenRouter can be used **only** for classifying entities on top of a timestamped transcript, never for producing the timestamps.
-+2. **Transcribe** each channel with **word-level timestamps** and diarization by channel: AssemblyAI, one pinned model, `multichannel`, entity detection. An LLM via OpenRouter is used **only** for classifying entities on top of the timestamped transcript, never for producing the timestamps.
- 3. **PII entities:**
-    - person names (the customer's and the agent's, plus `extra_terms`);
-    - phone numbers;
-@@ -110,56 +111,71 @@ Sample submit payload:
- - **Coaching:** `coaching.json` = `{summary, strengths[], improvements[], scores{rapport,discovery,objections,close,compliance}, turning_point_clip_id, rubric:"fe_v1", model}`.
- - **Transcript:** JSON of `[{channel, speaker:"customer"|"agent", start_ms, end_ms, text}]`. Redacted words appear as `[REDACTED:<TYPE>]`. A `.txt` render is also provided.
+ - `agent_ref` is a pseudonym. The service never receives agent names except in `extra_terms`, which are the terms to bleep.
+@@ -112,84 +112,70 @@ Sample submit payload:
  - **PII spans:** `[{type, start_ms, end_ms, channel, confidence, detector:"model"|"regex"|"digit_run"|"extra_term", padded_start_ms, padded_end_ms}]`. They contain **no original text**.
--- **Status:** `queued` → `fetching` → `transcribing` → `redacting` → `verifying` → `done` | `failed` (with `error_code`: `fetch_expired` | `bad_audio` | `asr_failed` | `timeout`).
-+- **Status:** `queued` → `fetching` → `transcribing` → `redacting` → `verifying` → `done` | `failed` (with `error_code`: `fetch_expired` | `bad_audio` | `asr_failed` | `timeout` | `unsupported_source` | `cost_cap` | `internal`), and `deleted` after a takedown. The worker moves the status forward through the bridge (`status`); it lives on TR's job row.
+ - **Status:** `queued` → `fetching` → `transcribing` → `redacting` → `verifying` → `done` | `failed` (with `error_code`: `fetch_expired` | `bad_audio` | `asr_failed` | `timeout`).
  
 -Callback (POST to `callback_url`):
-+**Delivery (pull through the bridge; there is no callback).**
-+1. The worker asks the bridge (`sign`) for signed upload URLs under `training-library/<job_id>/` and PUTs each file there: `redacted.mp3`, `clips/cN.mp3`, `transcript.json`, `transcript.txt`, `pii_spans.json`, `clips.json`, `coaching.json`. Nothing is uploaded anywhere else, and the worker keeps no copy.
-+2. It then calls the bridge's `complete`. The bridge checks every named file is in the job's prefix, and `sample_library_ingest` writes, in one transaction, the job as `done` plus `training_library_calls` (`pending_qa`), `_call_sources` and `_clips`. A repeat by the same run returns the same library row.
- ```json
- {
+-```json
+-{
 -  "job_id": "srj_01J…",
 -  "idempotency_key": "call:2948f3a3-…:v1",
 -  "call_id": "2948f3a3-…",
 -  "status": "done",
-+  "action": "complete", "job_id": "6e1e1645-…", "run_id": "wrun_01J…",
-+  "pipeline_version": "sr-2.0.0", "schema_version": "1.0",
-   "qa_flag": true,
+-  "qa_flag": true,
 -  "qa_reasons": ["second_pass_digit_run@612340ms"],
-+  "qa_reasons": ["channel_map_unverified", "second_pass_digit_run@612340ms"],
-   "metrics": { "asr_confidence": 0.91, "clips": 6, "pii_spans": 37, "bleeped_ms": 18450, "duration_ms": 764000 },
-   "artifacts": {
+-  "metrics": { "asr_confidence": 0.91, "clips": 6, "pii_spans": 37, "bleeped_ms": 18450, "duration_ms": 764000 },
+-  "artifacts": {
 -    "redacted_audio": { "url": "<signed, 24h>", "sha256": "…", "bytes": 12345678 },
 -    "clips": [
 -      { "clip_id": "c1", "label": "opener", "start_ms": 2100, "end_ms": 48300, "audio_exported": true,
@@ -147,169 +64,168 @@ index 9bacdd6c..b7bd756f 100644
 -    "coaching_json": { "url": "<signed, 24h>", "sha256": "…" },
 -    "transcript_json": { "url": "<signed, 24h>", "sha256": "…" },
 -    "pii_spans_json": { "url": "<signed, 24h>", "sha256": "…" }
-+    "redacted_audio": { "name": "redacted.mp3", "sha256": "…", "bytes": 12345678 },
-+    "transcript_json": { "name": "transcript.json", "sha256": "…" },
-+    "transcript_txt": { "name": "transcript.txt", "sha256": "…" },
-+    "pii_spans_json": { "name": "pii_spans.json", "sha256": "…" },
-+    "clips_json": { "name": "clips.json", "sha256": "…" },
-+    "coaching_json": { "name": "coaching.json", "sha256": "…" }
-   },
+-  },
 -  "engine": { "asr": "assemblyai:universal", "pii": "assemblyai+regex v1", "llm": "openrouter:<model>" },
 -  "completed_at": "2026-10-12T23:20:11Z"
-+  "clips": [
-+    { "clip_id": "c1", "label": "opener", "sub_label": null, "start_ms": 2100, "end_ms": 48300, "audio_exported": true,
-+      "audio": { "name": "clips/c1.mp3", "sha256": "…" }, "title": "Warm opener, sets agenda",
-+      "coaching": { "did": "…", "worked": "…", "improve": "…", "key_lines": ["…"], "scores": { "rapport": 4 } }, "confidence": 0.82 },
-+    { "clip_id": "c6", "label": "application", "sub_label": null, "start_ms": 1490000, "end_ms": 1820000, "audio_exported": false, "audio": null, "coaching": { "…": "…" } }
-+  ],
-+  "coaching": { "summary": "…", "strengths": ["…"], "improvements": ["…"], "scores": { "…": 4 }, "turning_point_clip_id": "c4", "rubric": "fe_v1", "model": "…" },
-+  "engine": { "asr": "assemblyai:<model>", "pii": "assemblyai-entities+rules+openrouter sr-2.0.0", "llm": "openrouter:<model>", "pipeline": "sr-2.0.0" }
- }
- ```
-+3. On a failure the worker calls `fail` with the code; the bridge ends the job and deletes both the scratch copy and any partial artifacts.
+-}
+-```
++**Return path: PULL through `sample-redaction-bridge` (decided by Dmitry 2026-10-13; there is no signed callback).**
++- The worker holds no Supabase key and no storage of its own. It calls TR's HMAC edge function `sample-redaction-bridge` with one `job_id` per call. Actions: `poll` (no job id) and, per job, `job | claim | source | sign | status | cost | asr | complete | fail | purge | vendor_purged`.
++- **TR never calls the worker.** Every ~20 s (`POLL_S`) the worker calls `poll`: it gets queued jobs to claim, refreshes `heartbeat_at` on the jobs it runs, gets the ones to `stop` (failed elsewhere, cancelled or gone), and gets finished jobs whose AssemblyAI copies still need deleting. A running job whose heartbeat is older than `SAMPLE_WORKER_STALE_S` (default 300) is failed by the bridge. Load: about 130k function calls a month.
++- `claim` is a compare-and-swap on status + `workflow_run_id`: the first run owns the job, and every later action must carry that run id (exactly-once).
++- `source` returns a fresh Telnyx link; `sign` returns signed upload/download URLs scoped to `sample-src/<job_id>/` and `training-library/<job_id>/` only. Audio never passes through the bridge.
++- The worker uploads `redacted.mp3`, `clips/<n>.mp3`, `clips.json`, `coaching.json`, transcript and `pii_spans.json` straight into `training-library/<job_id>/`.
++- `complete` checks every file is uploaded, then `public.sample_library_ingest` writes the job row, `training_library_calls`, `_call_sources` and `_clips` in one transaction (idempotent per job). `fail` records `error_code`. The `sample-src` scratch is deleted when the job ends.
++- Every payload carries `schema_version` "1.0", `qa_flag`, `qa_reasons`, `metrics` and `engine` as above.
  
  ## 4. Integration
  
  **Auth:**
- - Both directions use an HMAC-SHA256 header: `X-TR-Signature: t=<unix>,v1=<hex(hmac(secret, t + "." + raw_body))>`.
+-- Both directions use an HMAC-SHA256 header: `X-TR-Signature: t=<unix>,v1=<hex(hmac(secret, t + "." + raw_body))>`.
++- Worker → bridge uses an HMAC-SHA256 header: `X-TR-Signature: t=<unix>,v1=<hex(hmac(secret, t + "." + raw_body))>`.
  - Reject requests outside ±5 min.
 -- Each direction has its own secret. Secrets live only in Supabase function secrets and n8n credentials. The service's URL is not public; use an IP allowlist or a shared header too.
-+- One direction, one secret: every request goes worker → bridge, signed with `SAMPLE_REDACTOR_BRIDGE_SECRET`. It lives only in the Supabase function secrets and the worker host's secret store. A missing secret rejects.
-+
-+**Endpoints:**
-+- Worker: none. It is a background process with no open port.
-+- Bridge (called by the worker; the worker's only way into TR):
-+  - `poll` (no job): claimable jobs; heartbeats for the jobs the worker runs; `stop` (taken down or failed elsewhere); `cleanup` (finished jobs with no live run whose AssemblyAI copies still need deleting). It also fails running jobs whose heartbeat is older than `SAMPLE_WORKER_STALE_S` (default 300 s).
-+  - Per job: `job` (inputs), `claim`, `source` (fresh Telnyx link), `sign` (signed URLs, only under `sample-src/<job_id>/` and `training-library/<job_id>/`), `status`, `cost`, `asr` (records a vendor transcript id for deletion), `complete`, `fail`, `purge`, and `vendor_purged`, the run's last call, which ends its heartbeat and completes a takedown.
-+  - After `claim`, every action must come from the run that claimed it.
++- One secret, `SAMPLE_REDACTOR_BRIDGE_SECRET`, in Supabase function secrets and the worker container's env only. There is no TR → worker direction (the worker opens no port), so no `SAMPLE_REDACTOR_URL` / `SAMPLE_REDACTOR_START_SECRET`.
  
  **Lifecycle:**
 -- `POST /jobs` (submit). The same `idempotency_key` returns the existing job; `:v2` forces a reprocess.
 -- `GET /jobs/:id` (status).
 -- The callback fires on `done` or `failed`. It is retried 5× with exponential backoff (1 m → 2 h). TR deduplicates on `job_id` + `status`.
 -- `fetch_expired` → TR re-signs the link and resubmits with the same key.
--- A job running over 2 h is marked `failed:timeout`.
-+- Submit: TR writes the job (key `call:<id>:v<n>`; the same key returns the existing job, `:v2` reprocesses). The worker picks it up on its next poll.
-+- Exactly once: the first run to `claim` a queued job owns it (compare-and-swap); a second worker polling at the same time loses the claim and drops it.
-+- Liveness: a dead worker's jobs are failed after `SAMPLE_WORKER_STALE_S` without a heartbeat (`internal: worker stopped responding`); the AM retries.
-+- Status: there is no `GET /jobs/:id`; TR reads its own job row.
-+- `fetch_expired` → TR's `retry` queues the job again with the same key (the next attempt fetches a fresh link).
-+- A job running over 2 h is marked `failed:timeout` (bridge, and TR's sweep).
++- Submit (`training-library-admin`) only queues the job; the same `idempotency_key` returns the existing job; `:v2` forces a reprocess. The worker claims it on its next poll.
++- There is no callback. The worker reports `status`, `complete` and `fail` through the bridge; its steps retry (4 tries) and bridge actions are idempotent per job and run.
++- `fetch_expired` → retry queues the job again with the same key; the bridge's `source` hands out a fresh link.
++- **Cancel** (admin/superadmin, Dmitry 2026-10-13 1:41 PM): marks the call's queued/running jobs `failed:cancelled`; the worker aborts the run when the next poll lists it in `stop`. The worker has no cancel endpoint and nothing is deleted on its side; the run may still report spend already incurred.
+ - A job running over 2 h is marked `failed:timeout`.
  
--**Storage:**
+ **Storage:**
 -- Private Supabase bucket `sample-library`. The service's signed links are only for TR to copy from.
 -- TR copies the artifacts into `sample-library/<call_id>/v<n>/…` and serves them only as short-lived signed URLs (admin role check, the same pattern as `recording-proxy`).
 -- The service deletes its copies 7 days after the callback.
-+**Storage (TR side only; RL-1 buckets, private):**
-+- `sample-src/<job_id>/`: the worker's scratch between steps (source copy, names, spans, clip windows). Deleted when the job ends, done or failed.
-+- `training-library/<job_id>/`: the artifacts. Served only as short-lived signed links (staff via `training-library-admin` `link`, access logged).
-+- Paths carry the job id, never `calls.id`.
++- RL-1 private buckets only: `sample-src/<job_id>/` (scratch, deleted when the job ends) and `training-library/<job_id>/` (results). Served only as short-lived signed URLs.
++- **The service keeps nothing**: no database, tables, buckets or KV; `/tmp` scratch per step is removed; AssemblyAI copies are deleted on success and failure. Container logs hold ids, hashes and counts only.
  
--**Proposed TR tables (not created):**
-+**Deletion (takedown):**
-+1. TR's `delete` tombstones the call first; every bridge action then refuses it. It fails a running job, purges both buckets, and withdraws and empties the library rows.
-+2. A job with no AssemblyAI copy and no live run is `deleted` at once.
-+3. Otherwise the worker learns it on its next poll (`stop`, or `cleanup` if its run is gone), deletes the AssemblyAI copies and reports `vendor_purged`. The bridge then purges again and marks the job `deleted`.
-+
-+**TR tables (built: RL-1 `20261012180000_training_library` + worker columns `20261013090000_sample_redaction_worker`):**
+ **Proposed TR tables (not created):**
  - `sample_redaction_jobs`: id, call_id, idempotency_key unique, status, qa_flag, qa_reasons jsonb, metrics jsonb, engine jsonb, submitted_by, timestamps.
  - `training_library_calls`: id, call_id, job_id, version, agent_ref (pseudonym), source_agent_id (admin-only column), vertical, duration_s, full-audio path and sha256, `coaching` jsonb, title, tags, `status` (`pending_qa` | `published` | `rejected` | `withdrawn`).
  - `training_library_clips`: id, library_call_id, label, sub_label, start_ms, end_ms, audio path (nullable when not exported), sha256, title, `coaching` jsonb, sort order.
-@@ -184,30 +200,18 @@ Callback (POST to `callback_url`):
++- **Staff-only columns (RL-1 rule):** `call_id` and `source_agent_id` are readable by AMs/admins only; agents never read them (RLS/view excludes them; storage paths use `job_id`, never `call_id`).
+ - `training_library_reviews`: append-only `(library_call_id, reviewer, decision, listened_full bool, notes, at)`. **Publishing requires one QA review with `listened_full=true`** (full call plus every clip).
+ - `training_library_ratings`:
+   - Columns: id, agent_id, item_type (`call` | `clip`), item_id, `vote smallint check (vote in (-1,1))` (+1 = green up arrow, -1 = red down arrow), comment text (optional, ≤1000 chars), created_at, updated_at.
+   - Unique `(agent_id, item_type, item_id)`, so a repeat rating is an upsert.
+   - RLS: an agent can select/insert/update only rows where `agent_id = auth.uid()`; AM/admin can select all. No delete for agents (they can edit instead).
+   - Internal record only. **Never shown to other agents**: no aggregates in the agent UI. This table is TR-side only; the service never sees it.
+-- Manifest: a view joining the above with consent refs and hashes, for audits and withdrawal.
++- Manifest: a view joining the above with hashes, for audits and withdrawal.
++- `sample_spend_ledger` (service_role only): job_id, UTC month, usd of hard-deleted jobs, so a delete never resets the month cap. No call content.
+ 
+ **UI** (see TR_PLAN.md): an AM/admin curation page (pick, submit, status, QA listen, publish/withdraw) and a read-only **Recording Library** tab for agents (clip list by label, player, coaching notes).
+ 
+ ## 5. Security and compliance (internal training only)
+ 
+-- **Scope:** Final Expense `Sale` calls only, confirmed by Dmitry. Medicare and ACA are excluded.
++- **Scope:** ended `Sale` calls of **every vertical** (final_expense, medicare, aca), Dmitry 2026-10-13 12:44 PM. The vertical comes from the call's agent (`agents.verticals`); an agent with no or several verticals is refused, never defaulted (Dmitry 1:41 PM).
+ - **Use:** internal training for logged-in TR agents, AMs and admins only. No marketing, public or buyer-facing use. That removes the CMS marketing-material question, the external legal approval of each item, and the public player. If use ever becomes external, the old marketing controls come back.
+ - **Still required:**
+   - **PII redaction + a human QA listen of every published full call and clip.** One miss exposes a consumer's PII to the whole agent base.
+-  - **Agent consent:** a featured agent's voice and performance are shown to peers and coached on. Get a one-time training-use release (portal checkbox), revocable; revoking withdraws their items. Agent names are bleeped and shown as pseudonyms.
++  - **Agent consent: not required** (Dmitry 2026-10-13 12:44 PM): no consent UI, no consent check on submit, ingest or publish. Agent names are still bleeped and shown as pseudonyms.
+   - **Caller side:** callers were told calls are recorded; internal training/quality use usually fits that disclosure. Confirm the actual disclosure wording once (one-time review, not per item). Exclude calls from all-party consent states if the disclosure wording does not clearly cover training.
    - **Health details:** bleep conditions and medications in the audio. The `application` clip has no audio by default.
    - **Access:** RLS-gated, short signed links, no downloads in the UI, access logged.
  - **Retention:**
 -  - Service: copies deleted ≤7 days after the callback.
-+  - Service: none. Temp files are deleted at the end of every step; AssemblyAI transcripts are deleted when the job ends (and again on takedown). The worker keeps nothing between jobs; its logs hold ids, hashes and counts only.
++  - Service: keeps nothing (no 7-day retention); see §4 Storage.
    - TR `sample-src` copies: deleted after the job finishes.
    - Library: reviewed every 12 months; withdrawn on agent revoke or a consumer request.
  - **Vendors:** zero data retention, no training on the data. LLM calls get transcript text only, never audio.
  
 -## 6. n8n feasibility
--
--**Fits:** orchestration.
--- Webhook node: submit, plus an HMAC check in a Code node.
--- HTTP Request node: download the binary, then call AssemblyAI/Deepgram.
--- Wait node or polling loop: wait for the async speech-to-text result, or use the vendor's own webhook.
--- Code node: regex, digit runs and span merging.
--- OpenRouter: an HTTP or AI node for the entity check, clip segmentation and coaching.
--- HTTP Request: the signed callback.
--- Postgres or Data Table: job state.
-+## 6. Implementation (in-house, no n8n)
++## 6. n8n feasibility (superseded)
++
++**Superseded 2026-10-13:** the service is built without n8n (a plain Node worker + ffmpeg in dimatxt01/ai-redactor) and returns results by pull through `sample-redaction-bridge`, not a callback. The original n8n analysis is kept below for history only.
++
++<details><summary>Superseded n8n analysis</summary>
  
--**Limits:**
--- n8n has **no audio DSP**. Bleeping, padding, channel split, pitch-shift and clipping need ffmpeg: Execute Command (self-hosted only) or a small ffmpeg worker container called by HTTP.
--- **Long audio:** 30–40 min mp3s are ~30–60 MB. With default in-memory binary mode memory blows up, so set `N8N_DEFAULT_BINARY_DATA_MODE=filesystem` or use S3 mode.
--- **Timeouts:** speech-to-text for a 40-min call takes minutes. Use async with a vendor webhook or Wait-node polling, never a blocking HTTP call. Raise `EXECUTIONS_TIMEOUT`.
--- **n8n Cloud:** limits on executions and binary size, and no Execute Command, so **self-hosted is recommended**.
--- **Retries and idempotency:** store them in the DB yourself; n8n's retry-on-fail alone is not enough.
--- **Clips and coaching:** one LLM call per call (segmentation + coaching JSON with a schema check in a Code node), then an ffmpeg cut per clip. This adds about 1–2 min per call.
--- **Recommended shape:** n8n for orchestration, AssemblyAI (audio redaction built in) or Deepgram plus an ffmpeg worker, regex and LLM in Code/HTTP nodes.
-+- `ai-redactor`, a separate repo: one Node 22 process in a Docker image (any always-on container host, outbound HTTPS only), with ffmpeg (`ffmpeg-static`) for bleeping, mixing and clips.
-+- It runs each job start to finish (claim → fetch → transcribe → detect → render → clips + coaching → verify → complete), up to `WORKER_CONCURRENCY` (2) at a time, retrying transient errors per step.
-+- Long calls: the worker polls AssemblyAI's status with its own key while it works (no inbound webhook).
-+- Between steps it holds only ids, hashes, counts and offsets; text lives in TR's `sample-src/<job_id>/` scratch in between.
-+- A restart (SIGTERM) fails the running jobs as `internal: worker restarted`; the AM retries.
+ **Fits:** orchestration.
+ - Webhook node: submit, plus an HMAC check in a Code node.
+@@ -209,6 +195,8 @@ Callback (POST to `callback_url`):
+ - **Clips and coaching:** one LLM call per call (segmentation + coaching JSON with a schema check in a Code node), then an ffmpeg cut per clip. This adds about 1–2 min per call.
+ - **Recommended shape:** n8n for orchestration, AssemblyAI (audio redaction built in) or Deepgram plus an ffmpeg worker, regex and LLM in Code/HTTP nodes.
  
++</details>
++
  ## Open items to verify
  - Customer and agent channel order in the dual-channel mp3.
-@@ -220,13 +224,13 @@ Callback (POST to `callback_url`):
- - **Dual channel:**
-   - TR records `mp3`, `channels:'dual'` (Telnyx `record_start`). Each leg is on its own channel.
-   - Which channel is the customer is **not yet verified**. Telnyx maps channels by call leg; check their `record_start` docs.
--  - Run `ffprobe -show_streams` on a few freshly signed pilot files, listen to the first 10 s of each channel, and record the result as `channel_map` in the submit payload. Don't infer it at runtime.
-+  - Run `ffprobe -show_streams` on a few freshly signed pilot files, listen to the first 10 s of each channel, and record the result as `channel_map` on the job (the AM's choice on submit). Don't infer it at runtime.
+ - Sample rate and bitrate. Probe with `ffprobe` on a freshly re-signed link during the pilot.
+@@ -224,7 +212,7 @@ Callback (POST to `callback_url`):
    - Transcribe each channel separately; this gives speaker labels for free.
  - **Idempotency:**
--  - `POST /jobs` with an existing `idempotency_key` returns the existing job (same `job_id`); the job never runs twice.
+   - `POST /jobs` with an existing `idempotency_key` returns the existing job (same `job_id`); the job never runs twice.
 -  - Callbacks are at-least-once. Every callback carries `job_id`, `status` and `attempt`. TR dedupes on `(job_id, status)` and returns 2xx for duplicates.
-+  - Submitting an existing `idempotency_key` returns the existing job (same `job_id`); the job never runs twice.
-+  - Two workers that see the same queued job: one wins the `claim`, the other drops it. `complete`, `fail` and the cost ledger (per item) are idempotent, so a retried step does nothing twice.
++  - No callbacks. Bridge `claim` is compare-and-swap; repeated `complete`/`fail` from the owning run are no-ops, other runs are refused.
  - **Length and timeouts:**
--  - Plan for **60 min max** (49-min calls exist), about 60 MB mp3. Reject anything over 90 min with `bad_audio:too_long`.
-+  - Plan for **60 min max** (49-min calls exist), about 60 MB mp3. Reject anything over 60 min (±5%) with `bad_audio:too_long`.
+   - Plan for **60 min max** (49-min calls exist), about 60 MB mp3. Reject anything over 90 min with `bad_audio:too_long`.
    - Everything is async: speech-to-text through the vendor's async API with a webhook or polling, never a synchronous HTTP call.
-   - Per-job wall clock is 2 h. Stream the download to disk, not memory.
- - **Models:**
-@@ -250,13 +254,11 @@ Callback (POST to `callback_url`):
+@@ -246,17 +234,21 @@ Callback (POST to `callback_url`):
+   - TR stores `schema_version` on each job.
+ - **Test fixtures:**
+   - 10–15 **synthetic** two-channel calls (TTS or staff role-play) with PII planted at known timestamps: names, phone, address, DOB, SSN, card, MBI, digits spelled out and read back, crosstalk, and a 45–50 min long call.
+-  - Optionally a few real calls with consent.
++  - Optionally a few real internal calls.
    - CI target: 100% of planted PII bleeped (with padding), 0 PII in the second pass, clip labels stable across 3 reruns.
    - Never use real customer calls as fixtures.
  - **Retries:**
--  - Fetch: 3× with backoff 30 s / 2 m / 10 m. If the signed URL expired, return `fetch_expired` so TR re-signs; don't retry.
--  - STT and LLM: 3× with exponential backoff and jitter.
+   - Fetch: 3× with backoff 30 s / 2 m / 10 m. If the signed URL expired, return `fetch_expired` so TR re-signs; don't retry.
+   - STT and LLM: 3× with exponential backoff and jitter.
 -  - Callback: 5× over about 2 h.
-+  - Fetch: a fresh link per attempt. If Telnyx no longer has the recording (or the download is refused), fail with `fetch_expired`; TR's retry restarts the job.
-+  - STT, LLM and bridge calls: the step is retried with backoff (transient errors only, up to 4 tries).
++  - Bridge calls: retried by the worker's step retry; every bridge action is idempotent.
  - **Logging:** log job_id, call_id, status, timings, counts and cost only. **Never** transcripts, PII text, signed URLs or secrets. Redact URLs to the host.
  - **Secrets:**
--  - Separate HMAC secrets for each direction. Rotate every 90 days or on suspected exposure, with a 24 h overlap where both old and new are accepted (`v1=` signature header supports several keys).
+   - Separate HMAC secrets for each direction. Rotate every 90 days or on suspected exposure, with a 24 h overlap where both old and new are accepted (`v1=` signature header supports several keys).
 -  - Vendor keys stay in n8n credentials only.
-+  - One HMAC secret (worker → bridge). Rotate every 90 days or on suspected exposure, with a 24 h overlap where both old and new are accepted (`v1=` signature header supports several keys).
-+  - Vendor keys stay in the worker host's secret store only.
++  - Vendor keys stay in the worker container's env only.
  - **Deletion:**
 -  - `DELETE /jobs/:id` (HMAC) removes every service-side copy (source, artifacts, transcripts, logs that reference the job) and confirms by callback `status:"deleted"`.
 -  - The automatic ≤7-day cleanup still applies.
-+  - Takedowns reach the worker through `poll` (`stop` / `cleanup`). It stops the run, deletes AssemblyAI's transcripts and reports `vendor_purged`; nothing is left in flight once a run returns, and the bridge purges TR storage again before marking the job `deleted`. The service holds no other copy.
++  - TR-initiated (Dmitry 2026-10-13 12:44 PM): **hard delete on TR's side only**, admin/superadmin only. Every `training_library_*` row and file of the call goes; no takedown record; job status `deleted` is never written. Refused (409 `IN_FLIGHT`) while a job is queued/running (cancel first), while a worker run still owns a job (heartbeat), or while its AssemblyAI copies wait for the worker's normal cleanup. Each job's spend moves to `sample_spend_ledger` first. Nothing is deleted on the service side; the service holds nothing. No `DELETE /jobs/:id` callback and no 7-day service cleanup.
++  - **Known limits (critic 5508438349):**
++    - **AssemblyAI deletion failing:** a call cannot be deleted while its AssemblyAI copies are still listed on a job (`vendor_pending`). If AssemblyAI deletion keeps failing, delete keeps answering 409 `IN_FLIGHT` until the worker's cleanup succeeds; the error says to retry. Raise it with AssemblyAI if it persists.
++    - **Retry window:** the blockers are checked before the first purge and again under the lock. A `retry` landing in the few ms between the pre-check and purge 1 can lose that job's TR files (the delete is then refused under the lock and the retried run re-fetches). Refusing `retry` during a delete would need a lock; it is admin-driven and tiny, so it is documented, not locked.
++    - **Stale zombie run:** a run whose heartbeat has been stale for more than `SAMPLE_WORKER_STALE_S` (default 300 s) is treated as dead. If it later posts `cost` after the call was deleted, it gets `NO_JOB` and that spend is not recorded in the month cap. Inherent to the hard delete; expected to be cents.
++    - **Follow-up (not done):** service_role keeps RL-1's `GRANT ALL` on `sample_redaction_jobs` and `training_library_reviews`, so a direct `DELETE`/`TRUNCATE` with the service key bypasses the spend ledger and append-only reviews. The edge functions only use the RPCs. Hardening service_role's rights is a later PR.
 diff --git a/docs/recording-library/TR_PLAN.md b/docs/recording-library/TR_PLAN.md
-index d6ce2880..fb25a1c2 100644
+index d6ce2880..8d4f2289 100644
 --- a/docs/recording-library/TR_PLAN.md
 +++ b/docs/recording-library/TR_PLAN.md
 @@ -1,7 +1,13 @@
  # True Ring side: Training Recording Library, PR plan v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers)
  
- **Ask:** a "Recording Library" tab for **internal training**. It holds smart clips of the key Final Expense sale moments (opener, discovery, objection handling, close, …), each with an AI coaching note, plus a coaching summary per call. AMs and admins pick calls manually; which agents is TBD.
+-**Ask:** a "Recording Library" tab for **internal training**. It holds smart clips of the key Final Expense sale moments (opener, discovery, objection handling, close, …), each with an AI coaching note, plus a coaching summary per call. AMs and admins pick calls manually; which agents is TBD.
 -Assumes the service in `SPEC.md` v0.2 is done. Planning only; nothing built.
-+Contract: `SPEC.md` v0.2 (delivery revised 2026-10-13: pull through the bridge). Status: RL-1 applied; RL-2, RL-3, the staff part of RL-4 and RL-5 built on `feat/sample-redaction`, not deployed.
++**Ask:** a "Recording Library" tab for **internal training**. It holds smart clips of the key sale moments (every vertical) (opener, discovery, objection handling, close, …), each with an AI coaching note, plus a coaching summary per call. AMs and admins pick calls manually; which agents is TBD.
++Assumes the service in `SPEC.md` v0.2 is done. Planning only. TR-side code for RL-2/3/5/8 (and RL-4 staff links) is *in `prb/rl-worker` (PR #347), not on main, not deployed*. Migration `20261013090000_sample_redaction_worker`, `sample-redaction-bridge` and `training-library-admin` are **not on main and not in prod**.
 +
-+**Revised 2026-10-13 (Dmitry): the service is built in-house, without n8n** — the worker is its own repo, `ai-redactor`: a plain Node background process in one container (ffmpeg, AssemblyAI, OpenRouter), deployed separately. It **polls** the bridge; TR never calls it; this branch (`feat/sample-redaction`) holds only the TR side: migration, `training-library-admin`, `sample-redaction-bridge`, the curation page.
++**Revised 2026-10-13 (Dmitry): the service is built in-house, without n8n** — the worker is its own repo, `ai-redactor` (plain Node background process + ffmpeg in one container, pull model, f282201), deployed separately; the TR side (migration, `training-library-admin`, `sample-redaction-bridge`, the curation page) is *in `prb/rl-worker` (PR #347), not on main, not deployed*.
 +It keeps no copies, so the **signed callback (RL-3) is replaced by a bridge**. The worker reads its inputs and writes its results
 +through ONE HMAC edge function, `sample-redaction-bridge`, straight into the RL-1 buckets. TR copies nothing, the service retains
-+nothing, and SPEC no longer has a callback, a 7-day service-side retention or `DELETE /jobs/:id` (removed 2026-10-13). `training-library-admin`'s delete removes
-+every copy, including AssemblyAI's. Every result and job row carries `schema_version` "1.0" (SPEC §7). Rows 2–5 below are updated to match.
++nothing, and the 7-day service-side retention and `DELETE /jobs/:id` callback are moot. `training-library-admin`'s delete is a
++hard delete of every TR copy (Dmitry 12:44 PM); AssemblyAI copies are removed by the worker's normal cleanup before delete is allowed. Every result and job row carries `schema_version` "1.0" (SPEC §7). Rows 2–5 below are updated to match.
  
  ## Where the tab goes (read-only check)
  - **Agent portal `/agent`:** single-page, state-driven tabs: welcome, dashboard, take-calls, calls, script, billing, referrals, activity, support, settings. There is already an **`ai-training` tab** in the state union, rendering `AITrainingInProgress` (a placeholder), and **there is no nav button for it**.
-@@ -31,13 +37,13 @@ Assumes the service in `SPEC.md` v0.2 is done. Planning only; nothing built.
+@@ -17,7 +23,8 @@ Assumes the service in `SPEC.md` v0.2 is done. Planning only; nothing built.
+ - The buyer/public player and the `sample_library_publish` flag.
+ - Pitch-shift by default (now off).
+ 
+-**Kept:** PII redaction, the human QA listen (`listened_full` required) before publishing, agent consent, Final Expense only.
++**Kept:** PII redaction, the human QA listen (`listened_full` required) before publishing.
++**Changed 2026-10-13 12:44 PM (Dmitry):** every vertical (from the call's agent; unknown or multi-vertical refused), ended calls only, **no agent consent** (no UI, no submit/publish requirement), delete = hard delete on TR's side only.
+ 
+ ## Standard gates for every PR
+ - Critic review on the exact head.
+@@ -31,22 +38,22 @@ Assumes the service in `SPEC.md` v0.2 is done. Planning only; nothing built.
  | # | PR | Contents | Flag | Effort | Depends on | Gos beyond the standard |
  |---|---|---|---|---|---|---|
  | 1 | **DB: tables + bucket** | `sample_redaction_jobs`, `training_library_calls`, `training_library_clips`, append-only `training_library_reviews`, `agent_training_consents`, `training_library_ratings` (unique agent+item, upsert; agents can see only their own rows, AM/admin can read all), manifest view. **RLS:** agents can read only `published` rows and never `source_agent_id`; AMs and admins can read and write. Private buckets `sample-src`, `training-library`. Flag row `recording_library`, disabled. | `recording_library` (disabled) | 1 d | — | Migration go |
@@ -317,17 +233,30 @@ index d6ce2880..fb25a1c2 100644
 -| 3 | **Edge: `training-redaction-callback`** | `verify_jwt=false`. HMAC check with ±5 min window. Dedupe. Copy full-call and clip audio and check sha256. Store `clips.json` and `coaching.json` as rows. Delete the `sample-src` copy. | — | 1–1.5 d | 1, 2 | **Vendor secret** `SAMPLE_SVC_HMAC_IN`. Deploy go. Critic focus: HMAC and replay. |
 -| 4 | **Edge: `training-library-link`** | 10-min signed links. Agents: published clips only, no full call (decide in Q3). AMs/admins: everything. Access is logged. | — | 0.5 d | 1, 3 | Deploy go |
 -| 5 | **AM/Admin curation page** (`/am/recording-library` + `/admin/recording-library`) | **Pick:** sales filtered by agent, 10–40 min, consent on file. **Submit.** **Jobs list** with retry. **QA view:** full-call player with bleep markers, clip list with labels and coaching, second-pass flags, edit clip titles, drop a clip, the "listened to full call + all clips" box (required). **Publish/withdraw.** **Manifest export.** **Ratings view:** per item, up count, down count, net score and comments (AM/admin only). | flag + AM/admin role | 3.5 d | 1–4 | Frontend deploy go |
-+| 2 | **Edge: `training-library-admin` (submit, retry, sweep, pick, review, publish, withdraw, edit, delete)** — *built* | AM/admin JWT check. Rules: Final Expense + `Sale` + Telnyx + ≤60 min + active agent consent; flag `recording_library` gates submit. Idempotency key `call:<id>:v<n>`; the estimate is reserved against the $100/month cap in SQL; the job is queued (the worker claims it on its next poll; TR never calls the worker). Delete = takedown of every copy (done at once, or when the worker confirms the vendor copies are gone). Migration `20261013090000_sample_redaction_worker` adds the worker columns, caps and `sample_library_ingest` on top of RL-1. | flag | built | 1 | **Secrets:** none new (optional caps, `SAMPLE_WORKER_STALE_S`). Migration go, deploy go. |
-+| 3 | **Edge: `sample-redaction-bridge`** (replaces the callback) — *built* | `verify_jwt=false`. HMAC ±5 min, one secret (the worker is the only caller). `poll` hands out queued jobs, refreshes heartbeats (`heartbeat_at`), names jobs to stop, lists vendor cleanups, and fails runs whose worker went quiet. Claim = compare-and-swap (one run per job); every later action must come from that run. Fresh Telnyx link per attempt; the worker downloads at once. Signed upload/download URLs only under `sample-src/<job_id>/` and `training-library/<job_id>/`. `complete` checks every file is uploaded, then `sample_library_ingest` writes the job, `training_library_calls`, `_call_sources` and `_clips` in one transaction. Scratch is deleted when the job ends. | — | built | 1, 2 | **Secret** `SAMPLE_REDACTOR_BRIDGE_SECRET`. Deploy go. Critic focus: HMAC, run ownership, takedown. |
-+| 4 | **Links** — *staff part built* (`training-library-admin` `link`) | 10-min signed links, access logged; the log is the reviewer's listen evidence. Staff: everything. **Agents: still to build with RL-7** (published clips only, no full call, decide in Q3). | — | 0.5 d (agents) | 1, 3 | Deploy go |
-+| 5 | **AM/Admin curation page** (`/am/recording-library` + `/admin/recording-library`) — *built* | **Pick:** sales filtered by agent, 10–40 min, consent on file. **Submit.** **Jobs list** with retry. **QA view:** full-call player with bleep markers, clip list with labels and coaching, second-pass flags, edit clip titles, drop a clip, the "listened to full call + all clips" box (required). **Publish/withdraw.** **Manifest export.** **Ratings view:** per item, up count, down count, net score and comments (AM/admin only). | flag + AM/admin role | 3.5 d | 1–4 | Frontend deploy go |
- | 6 | **Agent consent** | A one-time training-use release card in `/agent` (text version, time) with revoke; revoking withdraws that agent's items. The AM page shows consent status and can record a consent obtained offline. | flag | 1 d | 1 | Release text (Dmitry/Mo). Frontend deploy go. |
- | 7 | **Agent "Recording Library" tab** | Read-only in `/agent` (reuse the `ai-training` slot). Filter by label (opener / discovery / objection: price… / close). Clip cards: player, AI coaching note, scores, the per-call summary. Pseudonymized agents, no downloads. **Vote each clip/call up (+1, green arrow) or down (-1, red arrow) + optional comment** (upsert, own rating only, never shows others' ratings). Optional: also mount read-only browsing in AM View. | flag | 2.5 d | 1, 4, 5 (published content) | Frontend deploy go |
+-| 6 | **Agent consent** | A one-time training-use release card in `/agent` (text version, time) with revoke; revoking withdraws that agent's items. The AM page shows consent status and can record a consent obtained offline. | flag | 1 d | 1 | Release text (Dmitry/Mo). Frontend deploy go. |
+-| 7 | **Agent "Recording Library" tab** | Read-only in `/agent` (reuse the `ai-training` slot). Filter by label (opener / discovery / objection: price… / close). Clip cards: player, AI coaching note, scores, the per-call summary. Pseudonymized agents, no downloads. **Vote each clip/call up (+1, green arrow) or down (-1, red arrow) + optional comment** (upsert, own rating only, never shows others' ratings). Optional: also mount read-only browsing in AM View. | flag | 2.5 d | 1, 4, 5 (published content) | Frontend deploy go |
 -| 8 | **Ops** | Retention job (`sample-src` cleanup, yearly review), callback-failure alert, BUGLOG runbook. | — | 0.5 d | 3 | Deploy go |
-+| 8 | **Ops** | Retention job (`sample-src` cleanup, yearly review), BUGLOG runbook. *Built:* the 2 h sweep (on page load), ops-alert key `sample_cost_cap` (month cap blocking jobs). | — | 0.5 d | 3 | Deploy go |
++| 2 | **Edge: `training-library-admin` (submit, retry, sweep, pick, review, publish, withdraw, edit, delete)** — *in `prb/rl-worker` (PR #347), not on main, not deployed* | AM/admin JWT check. Rules: ended `Sale`, any vertical (from the agent), Telnyx, ≤60 min, no consent; flag `recording_library` gates submit. Idempotency key `call:<id>:v<n>`; the estimate is reserved against the $100/month cap in SQL; submit only queues (the worker polls). Admin-only `cancel` and hard `delete` (409 `IN_FLIGHT` until stopped; spend kept in `sample_spend_ledger`). Migration `20261013090000_sample_redaction_worker` adds the worker columns (incl. `heartbeat_at`), caps, ledger, `sample_library_ingest` and `sample_call_hard_delete` on top of RL-1. | flag | drafted (prb/rl-worker) | 1 | Optional secrets: caps, `SAMPLE_WORKER_STALE_S`. Migration go, deploy go. |
++| 3 | **Edge: `sample-redaction-bridge`** (replaces the callback) — *in `prb/rl-worker` (PR #347), not on main, not deployed* | `verify_jwt=false`. HMAC ±5 min, one secret (worker → TR only). `poll`: jobs to claim, heartbeats, stop list, vendor cleanup list. Claim = compare-and-swap (one run per job); every later action must come from that run. Fresh Telnyx link per attempt; the worker downloads at once. Signed upload/download URLs only under `sample-src/<job_id>/` and `training-library/<job_id>/`. `complete` checks every file is uploaded, then `sample_library_ingest` writes the job, `training_library_calls`, `_call_sources` and `_clips` in one transaction. Scratch is deleted when the job ends. | — | drafted (prb/rl-worker) | 1, 2 | **Secret** `SAMPLE_REDACTOR_BRIDGE_SECRET`. Deploy go. Critic focus: HMAC, run ownership, heartbeat/stop. |
++| 4 | **Links** — staff part *in `prb/rl-worker` (PR #347), not on main, not deployed* (`training-library-admin` `link`) | 10-min signed links, access logged; the log is the reviewer's listen evidence. Staff: everything. **Agents: (planned; not drafted), build with RL-7** (published clips only, no full call, decide in Q3). | — | 0.5 d (agents) | 1, 3 | Deploy go |
++| 5 | **AM/Admin curation page** (`/admin/recording-library` + `/am/recording-library`, one component `RecordingLibrary.tsx` with `portal="am"`; both mounts in `src/App.tsx` on prb/rl-worker, not merged to main, not deployed) — *in `prb/rl-worker` (PR #347), not on main, not deployed* | **Pick:** ended sales of every vertical, filtered by agent, 10–40 min. **Submit.** **Jobs list** with retry and admin-only cancel. **QA view:** full-call player with bleep markers, clip list with labels and coaching, second-pass flags, edit clip titles, drop a clip, the "listened to full call + all clips" box (required). **Publish/withdraw.** **Manifest export.** **Ratings view:** per item, up count, down count, net score and comments (AM/admin only). | flag + AM/admin role | 3.5 d | 1–4 | Frontend deploy go |
++| 6 | ~~Agent consent~~ | **Dropped** (Dmitry 2026-10-13 12:44 PM): no consent UI or requirement. | — | — | — | — |
++| 7 | **Agent "Recording Library" tab** (planned; not drafted) | Read-only in `/agent` (reuse the `ai-training` slot). Filter by label (opener / discovery / objection: price… / close). Clip cards: player, AI coaching note, scores, the per-call summary. Pseudonymized agents, no downloads. **Vote each clip/call up (+1, green arrow) or down (-1, red arrow) + optional comment** (upsert, own rating only, never shows others' ratings). Optional: also mount read-only browsing in AM View. | flag | 2.5 d | 1, 4, 5 (published content) | Frontend deploy go |
++| 8 | **Ops** | Retention job (`sample-src` cleanup, yearly review) and BUGLOG runbook (planned; not drafted). In prb/rl-worker (not on main, not deployed): the 2 h sweep (on page load), ops-alert key `sample_cost_cap` (month cap blocking jobs). | — | 0.5 d | 3 | Deploy go |
  
  **Total:** about **11–11.5 dev-days**, plus critic and go loops. Ratings add about 1 d: the table in PR1, the AM read view in PR5, the agent UI in PR7.
  
+-**Pilot of 5:** PRs 1→2→3→4→5, plus consent recorded offline. AMs QA the first 5 before PR 7 lets agents see anything.
++**Pilot of 5:** PRs 1→2→3→4→5 plus the worker container. AMs QA the first 5 before PR 7 lets agents see anything.
+ 
+ ## Open questions (for Dmitry / Mo)
+ 1. **Which agents** are featured (TBD), and how many calls per agent?
+ 2. **Who curates:** all AMs, or a named set? Can an AM submit calls from agents outside their book?
+ 3. **What agents see:** clips only, or also the full redacted call? Should featured agents see their own coaching and scores?
+ 4. **Clip taxonomy and rubric:** confirm the labels and the `fe_v1` scoring dimensions, or supply your own script stages.
+-5. **Visibility:** all agents, or only Final Expense agents or specific tiers? New agents first (onboarding)?
++5. **Visibility:** all agents, or only agents of the call's vertical, or specific tiers? New agents first (onboarding)?
+ 6. **Replace the hidden `ai-training` slot,** or add a separate tab?
 diff --git a/src/App.tsx b/src/App.tsx
 index d21cf757..d6dcc99d 100644
 --- a/src/App.tsx
@@ -468,7 +397,7 @@ index fbce6fbd..dbc35a33 100644
 +[functions.sample-redaction-bridge]
 +verify_jwt = false
 diff --git a/supabase/functions/integrity-audit/manifest.json b/supabase/functions/integrity-audit/manifest.json
-index 61af2159..59475583 100644
+index 61af2159..871676e5 100644
 --- a/supabase/functions/integrity-audit/manifest.json
 +++ b/supabase/functions/integrity-audit/manifest.json
 @@ -1,5 +1,5 @@
@@ -478,17 +407,16 @@ index 61af2159..59475583 100644
    "generated_from": "live catalog, project snwzhaylpbxrjaebcbib, 2026-08-03 ~22:00Z (post BUG-033 apply). Reviewed like code: every change to this file is a deliberate statement about what production SHOULD be.",
    "flags": {
      "must_exist_disabled_forever": [
-@@ -443,6 +443,8 @@
+@@ -443,6 +443,7 @@
      {"table": "training_library_calls", "trigger": "training_library_publish_gate"},
      {"table": "training_library_reviews", "trigger": "training_library_reviews_append_only"},
      {"table": "agent_training_consents", "trigger": "training_library_consent_revoked"},
 +    {"table": "sample_redaction_jobs", "trigger": "sample_redaction_jobs_service_columns"},
-+    {"table": "training_library_calls", "trigger": "sample_redaction_takedown_guard"},
      {
        "table": "target_requests",
        "trigger": "account_chat_target_requests_ins"
 diff --git a/supabase/functions/ops-alert/index.ts b/supabase/functions/ops-alert/index.ts
-index 46d25641..bedd035b 100644
+index 46d25641..f23b3e9a 100644
 --- a/supabase/functions/ops-alert/index.ts
 +++ b/supabase/functions/ops-alert/index.ts
 @@ -658,6 +658,29 @@ Deno.serve(async (req) => {
@@ -509,7 +437,7 @@ index 46d25641..bedd035b 100644
 +        console.warn('[ops-alert] sample_cost_cap read failed — skipping key this cycle:', capErr.message);
 +      } else {
 +        const n = (capRows ?? []).length;
-+        const spent = Math.max(0, ...(capRows ?? []).map((r: any) => Number(r.metadata?.spent_usd) || 0));
++        const spent = Math.max(0, ...(capRows ?? []).map((r: { metadata?: { spent_usd?: unknown } | null }) => Number(r.metadata?.spent_usd) || 0));
 +        const cap = Number((capRows ?? [])[0]?.metadata?.month_cap_usd) || 100;
 +        findings.push(n > 0
 +          ? { key: 'sample_cost_cap', level: 'degraded',

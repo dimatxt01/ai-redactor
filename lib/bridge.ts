@@ -60,6 +60,8 @@ export async function bridge<T = any>(action: string, payload: Record<string, un
   if (["fetch_expired", "unsupported_source", "cost_cap"].includes(code)) {
     throw jobError(code as "fetch_expired" | "unsupported_source" | "cost_cap", String(body.error ?? code).slice(0, 200));
   }
+  // The job row is gone (TR hard-deleted the call): treat it like an ended job — stop, never fail.
+  if (code === "NO_JOB") throw new FatalError(`NO_JOB: bridge ${res.status}`);
   // Another run owns the job, or it already ended: stop this run without touching the job.
   if (code === "DUPLICATE_RUN" || code === "JOB_TERMINAL") throw new FatalError(`${code}: bridge ${res.status}`);
   throw new FatalError(`internal: bridge ${res.status} ${code}`);
@@ -103,8 +105,8 @@ export async function getWorkJson<T>(jobId: string, runId: string, name: string)
 
 export type Poll = {
   jobs: { job_id: string; idempotency_key: string }[];   // queued, to claim (at most `capacity`)
-  stop: string[];                                         // jobs this worker runs that were taken down / failed elsewhere
-  cleanup: { job_id: string; transcript_ids: string[] }[]; // no live run: vendor copies to delete, takedowns to finish
+  stop: string[];                                         // jobs this worker runs that were cancelled / failed / deleted
+  cleanup: { job_id: string; transcript_ids: string[] }[]; // finished jobs with no live run: vendor copies to delete
   lost: number;                                            // running jobs the bridge just failed (their worker went quiet)
 };
 
@@ -113,7 +115,8 @@ export function poll(worker: string, running: { job_id: string; run_id: string }
   return bridge<Poll>("poll", { worker, running, capacity });
 }
 
-/** Tell TR these AssemblyAI transcripts are deleted (the owning run reports here last; it also ends the heartbeat). */
+/** Tell TR these AssemblyAI transcripts are deleted (the owning run reports here last; it also ends the heartbeat,
+ *  which is what lets TR delete the call). */
 export function vendorPurged(jobId: string, runId: string, transcriptIds: string[]) {
-  return bridge<{ ok: true; left: number; deleted: boolean }>("vendor_purged", { job_id: jobId, run_id: runId, transcript_ids: transcriptIds });
+  return bridge<{ ok: true; left: number; deleted: false }>("vendor_purged", { job_id: jobId, run_id: runId, transcript_ids: transcriptIds });
 }

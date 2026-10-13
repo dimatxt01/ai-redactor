@@ -43,6 +43,11 @@ export const CLIPS = { maxPerCall: 6, minS: 20, maxS: 240, fadeS: 1, snapSearchM
 
 export const PITCH_SEMITONES = -3;
 
+// The lines of insurance TR samples (TR resolves it from the call's agent and refuses anything else; the worker
+// never defaults it). One rubric (fe_v1) for all three until Dmitry rules on per-vertical rubrics.
+export const VERTICALS = { final_expense: "final-expense", medicare: "Medicare", aca: "ACA (Affordable Care Act) health" } as const;
+export type Vertical = keyof typeof VERTICALS;
+
 // Fixed clip labels (SPEC v0.2 §2.6): the only labels any result may carry.
 export const CLIP_LABELS = [
   "opener",

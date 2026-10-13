@@ -139,7 +139,7 @@ step "HMAC parity: Deno (TR) ↔ Node (worker)" "same header; same refusals" "${
 
 if command -v initdb >/dev/null || ls /opt/homebrew/opt/postgresql@1[5-9]/bin/initdb /usr/lib/postgresql/1[5-9]/bin/initdb >/dev/null 2>&1; then
   HAVE_PG=1
-  step "migration: throwaway Postgres on RL-1 (caps, race, guards, ingest, takedown, rollback)" "all cases pass; RL-1 cases still pass on top" \
+  step "migration: throwaway Postgres on RL-1 (caps, race, guards, ingest, cancel, hard delete, rollback)" "all cases pass; RL-1 cases still pass on top" \
     bash "$TRS/supabase/tests/sample_redaction/run.sh"
   step "RL-1 migration tests (unchanged, as on TrueRing main)" "RL-1 cases pass" bash "$TRS/supabase/tests/training_library/run.sh"
 else
@@ -206,7 +206,7 @@ fi
   echo "- vendors: $( [ $OFFLINE = 1 ] && echo 'off (--offline)' || { [ -n "${ASSEMBLYAI_API_KEY:-}" ] && echo "AssemblyAI on, OpenRouter $( [ -n "${OPENROUTER_API_KEY:-}" ] && echo on || echo off)" || echo 'no keys'; })"
   echo "- live systems touched: none"
   [ -n "${SIM_REPORT:-}" ] && [ -f "$SIM_REPORT" ] && echo "- simulation report: \`${SIM_REPORT#$W/}\` ($(grep -o '[0-9]* passed, [0-9]* failed' "$SIM_REPORT" | head -1))"
-  echo "- TrueRing frontend + full deno check: \`bash truering/check.sh /path/to/truering\` in a checkout of Mahamadou2004/truering feat/sample-redaction"
+  echo "- TrueRing frontend + full deno check: \`bash truering/check.sh /path/to/truering\` in a checkout of Mahamadou2004/truering prb/rl-worker"
   echo
   echo "| result | check | time | detail |"
   echo "|---|---|---|---|"

@@ -39,8 +39,12 @@ const SECRET = { bridge: `sim-bridge-${randomBytes(16).toString("hex")}`, sign: 
 const AM = "22222222-0000-0000-0000-0000000000a3";      // account_manager in the RL-1 fixture
 const ADMIN = "22222222-0000-0000-0000-0000000000ad";   // admin in the RL-1 fixture
 const CALLS = ["01-classic-sale", "07-bank-and-card", "09-objections"] as const;
-// extra TR calls reusing a test call's recording: a takedown mid-run, and a worker crash mid-run
-const EXTRA = [{ key: "takedown", fixture: "09-objections" }, { key: "crash", fixture: "01-classic-sale" }] as const;
+// extra TR calls reusing a test call's recording (and its agent's name, which the audio says): a cancel mid-run,
+// and a worker crash mid-run on a MEDICARE agent's call (every vertical is in scope; the coaching prompt follows it)
+const EXTRA = [
+  { key: "cancel", fixture: "09-objections", verticals: "{final_expense}" },
+  { key: "crash", fixture: "01-classic-sale", verticals: "{medicare}" },
+] as const;
 
 // ── tiny report ──────────────────────────────────────────────────────────────
 type Row = { section: string; ok: boolean; name: string; detail: string };
@@ -196,35 +200,40 @@ async function main() {
   psql("", path.join(TR, "supabase/migrations/20261012180000_training_library.sql"));
   psql("", path.join(TR, "supabase/migrations/20261013090000_sample_redaction_worker.sql"));
   psql("", path.join(ROOT, "sim/seed.sql"));
-  check("Postgres: RL-1 + worker migration applied", q1(`select count(*)::int n from pg_trigger where tgname in ('sample_redaction_jobs_service_columns','sample_redaction_takedown_guard')`).n === 2,
+  check("Postgres: RL-1 + worker migration applied", q1(`select count(*)::int n from pg_proc where proname in ('sample_call_hard_delete','sample_call_delete_blockers','sample_library_ingest')`).n === 3,
     "real migrations from truering/supabase/migrations on a throwaway cluster");
 
-  // TR rows: one agent per test call (consent on file), the call with a Telnyx-style recording URL
+  // TR rows: one agent per test call, the ended Sale call with a Telnyx-style recording URL
   const fakes = new Fakes({ storageDir: STORAGE, signKey: SECRET.sign, fixturesDir: fixtures, base: () => BASE(PORT.fakes) });
   const callId: Record<string, string> = {}, recId: Record<string, string> = {}, agentId: Record<string, string> = {};
   for (const c of CALLS) {
     callId[c] = randomUUID(); recId[c] = randomUUID(); agentId[c] = randomUUID();
     const dur = Math.max(60, Math.round(M[c].total_ms / 1000));
     psql(`insert into agents (id, full_name) values (${lit(agentId[c])}, ${lit(M[c].agent)});
-      insert into agent_training_consents (agent_id, consent_version, source) values (${lit(agentId[c])}, 'v1', 'offline');
-      insert into calls (id, agent_id, duration, disposition_id, recording_url, caller_name, caller_number)
-        values (${lit(callId[c])}, ${lit(agentId[c])}, ${dur}, (select id from call_dispositions where name = 'Sale'),
+      insert into calls (id, agent_id, duration, disposition_id, status, ended_at, recording_url, caller_name, caller_number)
+        values (${lit(callId[c])}, ${lit(agentId[c])}, ${dur}, (select id from call_dispositions where name = 'Sale'), 'completed', now(),
                 ${lit(`https://s3.amazonaws.com/telephony-recorder-prod/${recId[c]}-1700000000.mp3`)}, ${lit(M[c].caller)}, '+15125550100');`);
     fakes.addRecording(recId[c], path.join(fixtures, `${c}.mp3`), M[c]);
   }
   for (const x of EXTRA) {
-    callId[x.key] = randomUUID(); recId[x.key] = randomUUID();
-    psql(`insert into calls (id, agent_id, duration, disposition_id, recording_url, caller_name, caller_number)
-        values (${lit(callId[x.key])}, ${lit(agentId[x.fixture])}, ${Math.max(60, Math.round(M[x.fixture].total_ms / 1000))}, (select id from call_dispositions where name = 'Sale'),
+    callId[x.key] = randomUUID(); recId[x.key] = randomUUID(); agentId[x.key] = randomUUID();
+    psql(`insert into agents (id, full_name, verticals) values (${lit(agentId[x.key])}, ${lit(M[x.fixture].agent)}, ${lit(x.verticals)});
+      insert into calls (id, agent_id, duration, disposition_id, status, ended_at, recording_url, caller_name, caller_number)
+        values (${lit(callId[x.key])}, ${lit(agentId[x.key])}, ${Math.max(60, Math.round(M[x.fixture].total_ms / 1000))}, (select id from call_dispositions where name = 'Sale'), 'completed', now(),
                 ${lit(`https://s3.amazonaws.com/telephony-recorder-prod/${recId[x.key]}-1700000001.mp3`)}, ${lit(M[x.fixture].caller)}, '+15125550100');`);
     fakes.addRecording(recId[x.key], path.join(fixtures, `${x.fixture}.mp3`), M[x.fixture]);
   }
-  // out-of-scope rows: a Twilio-era call, an agent without consent
-  const twilioCall = randomUUID(), noConsentCall = randomUUID(), noConsentAgent = randomUUID();
-  psql(`insert into agents (id, full_name) values (${lit(noConsentAgent)}, 'Pat Nobody');
-    insert into calls (id, agent_id, duration, disposition_id, recording_url) values
-      (${lit(twilioCall)}, ${lit(agentId[CALLS[0]])}, 300, (select id from call_dispositions where name = 'Sale'), 'https://api.twilio.com/2010-04-01/Accounts/AC0/Recordings/RE0.mp3'),
-      (${lit(noConsentCall)}, ${lit(noConsentAgent)}, 300, (select id from call_dispositions where name = 'Sale'), ${lit(`https://s3.amazonaws.com/telephony-recorder-prod/${randomUUID()}-1.mp3`)});`);
+  // out-of-scope rows: a Twilio-era call, a call still in progress, agents with two verticals / none
+  const twilioCall = randomUUID(), liveCall = randomUUID(), twoVertCall = randomUUID(), noVertCall = randomUUID();
+  const twoVertAgent = randomUUID(), noVertAgent = randomUUID();
+  const sale = `(select id from call_dispositions where name = 'Sale')`;
+  const telnyx = () => lit(`https://s3.amazonaws.com/telephony-recorder-prod/${randomUUID()}-1.mp3`);
+  psql(`insert into agents (id, full_name, verticals) values (${lit(twoVertAgent)}, 'Pat Twofold', '{final_expense,medicare}'), (${lit(noVertAgent)}, 'Sam Nowhere', '{}');
+    insert into calls (id, agent_id, duration, disposition_id, status, ended_at, recording_url) values
+      (${lit(twilioCall)}, ${lit(agentId[CALLS[0]])}, 300, ${sale}, 'completed', now(), 'https://api.twilio.com/2010-04-01/Accounts/AC0/Recordings/RE0.mp3'),
+      (${lit(liveCall)}, ${lit(agentId[CALLS[0]])}, 300, ${sale}, 'in_progress', null, ${telnyx()}),
+      (${lit(twoVertCall)}, ${lit(twoVertAgent)}, 300, ${sale}, 'completed', now(), ${telnyx()}),
+      (${lit(noVertCall)}, ${lit(noVertAgent)}, 300, ${sale}, 'completed', now(), ${telnyx()});`);
 
   const fakeServer = await fakes.listen(PORT.fakes);
   process.on("exit", () => fakeServer.close());
@@ -249,6 +258,8 @@ async function main() {
       TR_BRIDGE_URL: BASE(PORT.bridge), SAMPLE_REDACTOR_BRIDGE_SECRET: secret,
       ASSEMBLYAI_API_KEY: "sim-assemblyai", OPENROUTER_API_KEY: "sim-openrouter",
       POLL_S: "2", ASR_POLL_S: "1", WORKER_CONCURRENCY: "2", TMPDIR: tmp, ALIVE_FILE: path.join(OUT, `alive-${name}`),
+      // orphan sweep: production 2 h 15 m; here 40 s, still longer than any simulated job lives
+      ORPHAN_AGE_S: "40", ORPHAN_SWEEP_S: "5",
     };
   };
   const startWorker = (name: string, secret?: string) => startProc(name, process.execPath, ["--import", "tsx", path.join(ROOT, "src/worker.ts")], workerEnv(name, secret));
@@ -273,7 +284,7 @@ async function main() {
   }
 
   // ── 2. AM curation rules ──
-  sectionStart("2. what an AM can submit (flag, scope, consent)");
+  sectionStart("2. what an AM can submit (flag, scope, vertical; no consent gate)");
   const c1 = CALLS[0], c7 = CALLS[1], c9 = CALLS[2];
   const opts = { extra_terms: ["Mutual of Omaha"], customer_channel: M[c1].customer_channel };
   {
@@ -282,12 +293,15 @@ async function main() {
     psql(`update feature_flags set enabled = true where key = 'recording_library'`);
     const pick = await asStaff(AM, { action: "pick", min_s: 60, max_s: 3600 });
     const ours = (pick.body.rows ?? []).filter((r: any) => Object.values(callId).includes(r.id));
-    check("pick lists the Sale calls with a Telnyx recording, agent name and consent", ours.length === Object.keys(callId).length && ours.every((r: any) => r.consent && r.agent_name),
-      `${pick.body.rows?.length ?? 0} rows; Twilio call listed: ${(pick.body.rows ?? []).some((r: any) => r.id === twilioCall)}`);
+    check("pick lists the ended Sale calls with a Telnyx recording, agent name and vertical", ours.length === Object.keys(callId).length && ours.every((r: any) => r.agent_name && r.vertical),
+      `${pick.body.rows?.length ?? 0} rows (verticals: ${[...new Set(ours.map((r: any) => r.vertical))].join(", ")}); Twilio call listed: ${(pick.body.rows ?? []).some((r: any) => r.id === twilioCall)}; live call listed: ${(pick.body.rows ?? []).some((r: any) => r.id === liveCall)}`);
     const tw = await asStaff(AM, { action: "submit", call_id: twilioCall, options: opts });
     check("Twilio-era recording → refused", tw.status === 422 && tw.body.error_code === "OUT_OF_SCOPE", `${tw.status} ${tw.body.error_code}`);
-    const nc = await asStaff(AM, { action: "submit", call_id: noConsentCall, options: opts });
-    check("agent without training consent → refused", nc.status === 422 && nc.body.error_code === "NO_CONSENT", `${nc.status} ${nc.body.error_code}`);
+    const lv = await asStaff(AM, { action: "submit", call_id: liveCall, options: opts });
+    check("a call that has not ended → refused", lv.status === 422 && lv.body.error_code === "NOT_ENDED", `${lv.status} ${lv.body.error_code}`);
+    const tv = await asStaff(AM, { action: "submit", call_id: twoVertCall, options: opts });
+    const nv = await asStaff(AM, { action: "submit", call_id: noVertCall, options: opts });
+    check("agent with two verticals, or none → refused, never defaulted", tv.body.error_code === "VERTICAL_UNKNOWN" && nv.body.error_code === "VERTICAL_UNKNOWN", `${tv.status} ${tv.body.error_code} / ${nv.status} ${nv.body.error_code}`);
     // month cap: a job that already spent $99.90 this month
     const spent = randomUUID();
     psql(`insert into sample_redaction_jobs (id, call_id, version, idempotency_key, status, cost_usd, reserved_usd, completed_at)
@@ -311,7 +325,7 @@ async function main() {
 
   // ── 4. duplicates and a forged pairing ──
   sectionStart(`4. ${c9}: both workers race for one job (job row with sparse options: worker defaults)`);
-  const ins = JSON.parse(psql(`set role service_role; select public.sample_job_insert(${lit(callId[c9])}, 1, ${lit(JSON.stringify({ customer_channel: M[c9].customer_channel }))}::jsonb,
+  const ins = JSON.parse(psql(`set role service_role; select public.sample_job_insert(${lit(callId[c9])}, 1, 'final_expense', ${lit(JSON.stringify({ customer_channel: M[c9].customer_channel }))}::jsonb,
       ${lit(JSON.stringify({ duration_s: Math.round(M[c9].total_ms / 1000), vertical: "final_expense", channel_map: { customer: M[c9].customer_channel, agent: 1 - M[c9].customer_channel, verified: false } }))}::jsonb, ${lit(AM)}, 0.3, 100)`).split("\n").pop()!);
   const job9 = String(ins.job_id);
   {
@@ -366,43 +380,53 @@ async function main() {
     check("publish → published", pub.status === 200 && st === "published", `${pub.status} ${pub.body.error_code ?? ""} status ${st}`);
   }
 
-  // ── 7. takedown ──
-  sectionStart(`7. ${c1}: delete every copy`);
+  // ── 7. hard delete of a finished, published call ──
+  sectionStart(`7. ${c1}: hard delete (admin only; TR side only)`);
   {
+    const am = await asStaff(AM, { action: "delete", call_id: callId[c1] });
+    check("an AM cannot delete (admin / superadmin only)", am.status === 403, `${am.status} ${am.body.error_code}`);
     const del = await asStaff(ADMIN, { action: "delete", call_id: callId[c1] });
-    const j = q1(`select status, deleted_at, delete_requested_at from sample_redaction_jobs where id = ${lit(job1)}`);
-    check("delete → 200 and the job is 'deleted' at once (finished job: no vendor copy left, no live run)", del.status === 200 && del.body.pending_worker === 0 && j.status === "deleted" && !!j.deleted_at, `${del.status} ${del.body.error_code ?? ""} job ${j.status}, pending_worker ${del.body.pending_worker}`);
+    const rows = q1(`select (select count(*) from sample_redaction_jobs where call_id = ${lit(callId[c1])})::int jobs,
+                            (select count(*) from training_library_calls where id = ${lit(lib1.id)})::int libs,
+                            (select count(*) from training_library_clips where library_call_id = ${lit(lib1.id)})::int clips`);
+    check("delete → 200; job, library call and clips rows are gone", del.status === 200 && rows.jobs === 0 && rows.libs === 0 && rows.clips === 0, `${del.status} ${del.body.error_code ?? ""} ${JSON.stringify(rows)}`);
     check("TR copies gone (both buckets)", !filesUnder("sample-src", job1).length && !filesUnder("training-library", job1).length,
       `left: ${[...filesUnder("sample-src", job1), ...filesUnder("training-library", job1)].join(", ") || "none"}`);
-    const l = q1(`select status, audio_path, coaching::text c from training_library_calls where job_id = ${lit(job1)}`);
-    const cl = q1(`select count(*)::int n from training_library_clips where library_call_id = ${lit(lib1.id)} and (audio_path is not null or coaching::text <> '{}')`);
-    check("library row withdrawn and emptied (audio paths + generated text)", l.status === "withdrawn" && !l.audio_path && l.c === "{}" && cl.n === 0, `status ${l.status}`);
+    const spend = q1(`select coalesce(sum(usd), 0)::float usd from sample_spend_ledger`).usd;
+    check("its spend stays in the month cap (moved to the spend ledger)", spend > 0, `$${spend}`);
     const asr = [...fakes.transcripts.values()].filter((t) => t.job === job1);
-    check("AssemblyAI copies deleted", asr.length > 0 && asr.every((t) => fakes.deleted.has(t.id)), `${asr.filter((t) => fakes.deleted.has(t.id)).length}/${asr.length}`);
-    const re = await asStaff(AM, { action: "submit", call_id: callId[c1], options: opts, reprocess: true });
-    check("the call cannot be sampled again", re.status === 409 && re.body.error_code === "DELETED", `${re.status} ${re.body.error_code}`);
+    check("AssemblyAI copies were already deleted (the worker did it when the job finished)", asr.length > 0 && asr.every((t) => fakes.deleted.has(t.id)), `${asr.filter((t) => fakes.deleted.has(t.id)).length}/${asr.length}`);
     const raw = JSON.stringify({ action: "job", job_id: job1 });
     const br = await fetch(BASE(PORT.bridge), { method: "POST", headers: { "x-tr-signature": signBody(SECRET.bridge, raw) }, body: raw });
-    check("bridge refuses the worker on a deleted job", br.status === 409, `HTTP ${br.status}`);
+    check("the bridge answers 404 NO_JOB for the deleted job (the worker treats it as stopped)", br.status === 404 && ((await br.json()) as { error_code?: string }).error_code === "NO_JOB", `HTTP ${br.status}`);
   }
 
-  // ── 8. takedown while a worker is running the job ──
-  sectionStart("8. takedown while a worker is mid-job");
+  // ── 8. cancel while a worker is running the job, then delete ──
+  sectionStart("8. cancel mid-run → the worker stops → vendor_purged → delete");
   {
     fakes.holdAsr = true;
-    const s8 = await asStaff(AM, { action: "submit", call_id: callId.takedown, options: { ...opts, customer_channel: M[c9].customer_channel } });
+    const s8 = await asStaff(AM, { action: "submit", call_id: callId.cancel, options: { ...opts, customer_channel: M[c9].customer_channel } });
     const job = String(s8.body.job_id);
     const mid = await waitJob(job, (st) => st === "transcribing", 60_000);
     const vendor = () => [...fakes.transcripts.values()].filter((t) => t.job === job);
     check("job is mid-run (transcribing; AssemblyAI has a copy)", mid.status === "transcribing" && vendor().length === 1, `${mid.seen.join(" → ")}; vendor copies ${vendor().length}`);
-    const del = await asStaff(ADMIN, { action: "delete", call_id: callId.takedown });
-    check("delete → 200, pending on the worker (it holds a live run)", del.status === 200 && del.body.pending_worker === 1, `${del.status} pending_worker ${del.body.pending_worker}`);
-    const end = await waitJob(job, (st) => st === "deleted", 30_000);
+    const early = await asStaff(ADMIN, { action: "delete", call_id: callId.cancel });
+    check("delete while in flight → 409 IN_FLIGHT (cancel first)", early.status === 409 && early.body.error_code === "IN_FLIGHT", `${early.status} ${early.body.error_code} ${early.body.error ?? ""}`);
+    const amc = await asStaff(AM, { action: "cancel", call_id: callId.cancel });
+    check("an AM cannot cancel (admin / superadmin only)", amc.status === 403, `${amc.status} ${amc.body.error_code}`);
+    const c = await asStaff(ADMIN, { action: "cancel", call_id: callId.cancel });
+    const row = q1(`select status, error_code from sample_redaction_jobs where id = ${lit(job)}`);
+    check("admin cancel → failed:cancelled, with one live run", c.status === 200 && c.body.cancelled === 1 && c.body.live_runs === 1 && row.status === "failed" && row.error_code === "cancelled", `${c.status} ${JSON.stringify(c.body)}`);
     const owner = ownerOf(job);
-    check("the worker stopped the job on its next poll; the job is 'deleted' once it reported", end.status === "deleted" && !!owner && logOf(owner).includes(`"event":"job_stop_requested","job_id":"${job}"`),
-      `${end.seen.join(" → ")} (${owner ?? "?"})`);
-    check("its AssemblyAI copy is deleted; TR storage is empty", vendor().length > 0 && vendor().every((t) => fakes.deleted.has(t.id)) && !filesUnder("sample-src", job).length && !filesUnder("training-library", job).length,
-      `${vendor().filter((t) => fakes.deleted.has(t.id)).length}/${vendor().length} vendor copies deleted`);
+    const stopped = !!owner && (await waitLog(owner, `"event":"job_ended","job_id":"${job}"`, 30_000));
+    const after = q1(`select heartbeat_at, coalesce(array_length(asr_transcript_ids, 1), 0) ids from sample_redaction_jobs where id = ${lit(job)}`);
+    check("the worker stopped it on its next poll, deleted its AssemblyAI copy and reported vendor_purged (heartbeat cleared)",
+      stopped && logOf(owner!).includes(`"event":"job_stop_requested","job_id":"${job}"`) && vendor().every((t) => fakes.deleted.has(t.id)) && !after.heartbeat_at && after.ids === 0,
+      `${owner ?? "?"}; heartbeat ${after.heartbeat_at ?? "null"}; ids left ${after.ids}; vendor ${vendor().filter((t) => fakes.deleted.has(t.id)).length}/${vendor().length}`);
+    check("the worker did not fail it again (stays failed:cancelled)", q1(`select error_code from sample_redaction_jobs where id = ${lit(job)}`).error_code === "cancelled");
+    const del = await asStaff(ADMIN, { action: "delete", call_id: callId.cancel });
+    const left = q1(`select count(*)::int n from sample_redaction_jobs where call_id = ${lit(callId.cancel)}`).n;
+    check("then delete → 200: rows and TR storage gone", del.status === 200 && left === 0 && !filesUnder("sample-src", job).length && !filesUnder("training-library", job).length, `${del.status} ${del.body.error_code ?? ""}; job rows ${left}`);
     fakes.holdAsr = false;
   }
 
@@ -423,15 +447,27 @@ async function main() {
     const row = q1(`select error_code, error_detail from sample_redaction_jobs where id = ${lit(job)}`);
     check(`after ${STALE_S} s without a heartbeat the bridge fails it ("worker stopped responding")`, failed.status === "failed" && /worker stopped responding/.test(row.error_detail ?? ""), `${row.error_code}: ${row.error_detail}`);
     const vendor = () => [...fakes.transcripts.values()].filter((t) => t.job === job);
-    for (let i = 0; i < 80 && !vendor().every((t) => fakes.deleted.has(t.id)); i++) await sleep(250);
+    // two ways a dead run's copy goes: its id was recorded → the cleanup list; killed between AssemblyAI's submit and
+    // the bridge `asr` record → nobody knows the id, and the orphan sweep (age > the job deadline) deletes it
+    for (let i = 0; i < 280 && !vendor().every((t) => fakes.deleted.has(t.id)); i++) await sleep(250);
     const left = q1(`select coalesce(array_length(asr_transcript_ids, 1), 0) n from sample_redaction_jobs where id = ${lit(job)}`).n;
-    check(`${other} deletes the dead run's AssemblyAI copy from its poll's cleanup list`, vendor().length > 0 && vendor().every((t) => fakes.deleted.has(t.id)) && left === 0 && logOf(other).includes(`"event":"cleanup_done","job_id":"${job}"`),
-      `${vendor().filter((t) => fakes.deleted.has(t.id)).length}/${vendor().length} deleted; ids left on the row ${left}`);
+    const via = logOf(other).includes(`"event":"cleanup_done","job_id":"${job}"`) ? "the cleanup list" : /"event":"orphan_sweep","listed":\d+,"deleted":[1-9]/.test(logOf(other)) ? "the orphan sweep (id was never recorded)" : "?";
+    check(`${other} deletes the dead run's AssemblyAI copy`, vendor().length > 0 && vendor().every((t) => fakes.deleted.has(t.id)) && left === 0,
+      `${vendor().filter((t) => fakes.deleted.has(t.id)).length}/${vendor().length} deleted via ${via}; ids left on the row ${left}`);
     check("TR storage left by the dead run is purged", !filesUnder("sample-src", job).length && !filesUnder("training-library", job).length);
     const rt = await asStaff(AM, { action: "retry", job_id: job });
     const done = await waitJob(job, (st) => st === "done" || st === "failed");
     check("AM retry → the surviving worker finishes it", rt.status === 200 && done.status === "done" && ownerOf(job) !== undefined, `${done.seen.join(" → ")}`);
     await verifyDone(job, M[c1], fakes);
+    check("Medicare call: the coaching prompt names the job's vertical (not final expense)", fakes.llm.systems.some((x) => x.startsWith("You coach Medicare insurance agents")),
+      `${fakes.llm.systems.filter((x) => x.startsWith("You coach Medicare")).length} Medicare prompts of ${fakes.llm.systems.length}`);
+
+    // the orphan sweep, deterministically: one transcript older than the age limit that no job knows, one young one
+    fakes.plantOrphan("orphan_old", 60_000);
+    fakes.plantOrphan("orphan_young", 0);
+    for (let i = 0; i < 80 && !fakes.deleted.has("orphan_old"); i++) await sleep(250);
+    check("orphan sweep: a transcript no job recorded, older than the job deadline, is deleted; a young one is left alone",
+      fakes.deleted.has("orphan_old") && !fakes.deleted.has("orphan_young"), `old ${fakes.deleted.has("orphan_old") ? "deleted" : "LEFT"}; young ${fakes.deleted.has("orphan_young") ? "DELETED" : "kept"}`);
 
     // graceful stop: SIGTERM ends the process cleanly
     const t0s = Date.now();
@@ -469,7 +505,7 @@ async function main() {
     "|---|---|---|",
     ...rows.map((r, i) => (i === 0 || rows[i - 1].section !== r.section ? `| | **${r.section}** | |\n` : "") + `| ${r.ok ? "PASS" : "**FAIL**"} | ${r.name} | ${r.detail.replace(/\|/g, "\\|")} |`),
     "",
-    `Listen: \`${path.relative(ROOT, STORAGE)}/training-library/<job_id>/redacted.mp3\` and \`clips/cN.mp3\` (the deleted call's files are gone by design).`,
+    `Listen: \`${path.relative(ROOT, STORAGE)}/training-library/<job_id>/redacted.mp3\` and \`clips/cN.mp3\` (deleted calls' files are gone by design).`,
     `Logs: \`${path.relative(ROOT, LOGS)}/\`.`,
   ].join("\n");
   writeFileSync(path.join(OUT, "report.md"), md + "\n");

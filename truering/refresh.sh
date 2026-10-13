@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Refreshes this REFERENCE COPY from a TrueRing checkout (Mahamadou2004/truering, branch feat/sample-redaction).
-# One direction only: TrueRing → here. Nothing in truering/ is ever applied to TrueRing from this repo.
+# Refreshes this MIRROR from a TrueRing checkout of Mahamadou2004/truering branch prb/rl-worker (later: main).
+# One direction only: TrueRing → here. Nothing in truering/ is ever applied or deployed from this repo.
 #
-#   bash truering/refresh.sh /path/to/truering   # copies FILES + SPEC + TR_PLAN + RL-1 copies, regenerates the patch
+#   git -C /path/to/truering fetch origin prb/rl-worker && git -C /path/to/truering checkout --detach origin/prb/rl-worker
+#   bash truering/refresh.sh /path/to/truering [prb/rl-worker]   # copies FILES + SPEC + TR_PLAN + RL-1 copies, regenerates the patch
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TR="$(cd "${1:?usage: bash truering/refresh.sh /path/to/truering}" && pwd)"
@@ -17,4 +18,6 @@ for f in docs/recording-library/SPEC.md docs/recording-library/TR_PLAN.md \
   copy "$f"
 done
 git -C "$TR" diff "$base" HEAD -- $(git -C "$TR" diff --name-only --diff-filter=M "$base" HEAD) > "$HERE/existing-files.patch"
+label="${2:-$(git -C "$TR" rev-parse --abbrev-ref HEAD)}"
+printf 'Mahamadou2004/truering %s @ %s (base main %s), refreshed %s\n' "$label" "$(git -C "$TR" rev-parse HEAD)" "$(git -C "$TR" rev-parse "$base")" "$(date -u +%Y-%m-%dT%H:%MZ)" > "$HERE/SOURCE"
 echo "refreshed from $(git -C "$TR" rev-parse --abbrev-ref HEAD) @ $(git -C "$TR" rev-parse --short HEAD) (base $(git -C "$TR" rev-parse --short "$base")): $(wc -l < "$HERE/FILES" | tr -d ' ') new files, $(grep -c '^diff --git' "$HERE/existing-files.patch") edited"

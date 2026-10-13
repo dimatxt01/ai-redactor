@@ -1,3 +1,4 @@
+DEPLOY_LIST.md
 scripts/rollbacks/rollback_20261013090000_sample_redaction_worker.sql
 src/components/recording-library/QaPanel.tsx
 src/components/recording-library/QaPlayer.tsx

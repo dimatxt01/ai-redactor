@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Read-only checks for the TrueRing side of the Recording Library worker, run INSIDE a TrueRing checkout of
-# Mahamadou2004/truering branch feat/sample-redaction. Touches nothing live: no Supabase project, no deploy.
+# Mahamadou2004/truering branch prb/rl-worker (later main). Touches nothing live: no Supabase project, no deploy.
 # It never copies anything into the checkout (truering/ here is a reference copy only).
 #
 #   bash truering/check.sh /path/to/truering            # from the ai-redactor repo
@@ -12,7 +12,7 @@ set -uo pipefail
 TR="${1:?usage: bash truering/check.sh /path/to/truering}"
 TR="$(cd "$TR" && pwd)"
 cd "$TR"
-[ -f supabase/functions/sample-redaction-bridge/index.ts ] || { echo "$TR has no sample-redaction-bridge: check out branch feat/sample-redaction of Mahamadou2004/truering"; exit 2; }
+[ -f supabase/functions/sample-redaction-bridge/index.ts ] || { echo "$TR has no sample-redaction-bridge: check out branch prb/rl-worker of Mahamadou2004/truering"; exit 2; }
 
 DENO=(npx -y deno@2.9.6)
 FAILS=0
@@ -26,15 +26,15 @@ step() {  # name cmd...
 echo "TrueRing-side checks · $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)$( [ -n "$(git status --porcelain)" ] && echo ' (uncommitted changes)')"
 
 step "edge functions: deno check" bash -c "cd supabase/functions && ${DENO[*]} check sample-redaction-bridge/index.ts training-library-admin/index.ts ops-alert/index.ts _shared/sampleSignature.ts _shared/telnyxRecording.ts"
-step "migration on a throwaway Postgres on RL-1 (caps, race, guards, ingest, takedown, rollback)" bash supabase/tests/sample_redaction/run.sh
+step "migration on a throwaway Postgres on RL-1 (caps, race, guards, ingest, cancel, hard delete, rollback)" bash supabase/tests/sample_redaction/run.sh
 step "RL-1 migration tests (unchanged)" bash supabase/tests/training_library/run.sh
 
 wiring() {
   node -e '
     const fs=require("fs"); const m=JSON.parse(fs.readFileSync("supabase/functions/integrity-audit/manifest.json","utf8"));
-    const want=[["sample_redaction_jobs","sample_redaction_jobs_service_columns"],["training_library_calls","sample_redaction_takedown_guard"]];
+    const want=[["sample_redaction_jobs","sample_redaction_jobs_service_columns"]];
     const t=JSON.stringify(m); for (const [tb,tr] of want) if(!t.includes(`"table":"${tb}","trigger":"${tr}"`)) { console.log("manifest missing", tb, tr); process.exit(1); }
-    console.log("manifest", m.manifest_version, "has both new triggers");'
+    console.log("manifest", m.manifest_version, "has the worker trigger");'
   for f in training-library-admin sample-redaction-bridge; do
     awk -v f="[functions.$f]" '$0==f{getline; if ($0 ~ /verify_jwt = false/) ok=1} END{exit !ok}' supabase/config.toml || { echo "config.toml: $f entry missing"; return 1; }
   done
@@ -43,7 +43,7 @@ wiring() {
   [ -z "$dup" ] || { echo "duplicate migration versions: $dup"; return 1; }
   ! grep -qiE 'update +(public\.)?feature_flags|insert +into +(public\.)?feature_flags' supabase/migrations/20261013090000_sample_redaction_worker.sql
 }
-step "repo: manifest triggers, verify_jwt entries, rollback, unique migration versions, no flag flips" wiring
+step "repo: manifest trigger, verify_jwt entries, rollback, unique migration versions, no flag flips" wiring
 
 [ -d node_modules ] || step "frontend: npm ci" npm ci --no-audit --no-fund
 OURS='src/pages/admin/RecordingLibrary.tsx|src/components/recording-library/|src/lib/recordingLibraryFlag.ts|src/App.tsx|src/components/AdminLayout.tsx|src/components/AMLayout.tsx'

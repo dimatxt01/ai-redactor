@@ -80,11 +80,12 @@ type Transcript = Record<string, unknown> & { id: string; job: string; pass: 1 |
 export class Fakes {
   readonly transcripts = new Map<string, Transcript>();
   readonly deleted = new Set<string>();
-  readonly llm = { calls: 0, retries: 0, clips: 0 };
+  readonly llm = { calls: 0, retries: 0, clips: 0, systems: [] as string[] };
   readonly telnyx = { lookups: 0, expired: new Set<string>() };
   readonly webhooks: string[] = [];
-  /** while true, every transcript reads back as still processing (keeps a job mid-run for takedown / crash scenarios) */
+  /** while true, every transcript reads back as still processing (keeps a job mid-run for the cancel / crash scenarios) */
   holdAsr = false;
+  listCalls = 0;
   readonly uploads: string[] = [];
   readonly downloads: string[] = [];
   readonly refusedStorage: string[] = [];
@@ -104,6 +105,11 @@ export class Fakes {
   }
 
   manifestForJob(job: string) { return this.jobFixture.get(job); }
+
+  /** a transcript nobody recorded (as if its worker died right after submitting), created `agoMs` ago */
+  plantOrphan(id: string, agoMs: number) {
+    this.transcripts.set(id, { id, job: "orphan", pass: 1, status: "completed", created: new Date(Date.now() - agoMs).toISOString(), words: [], entities: [] });
+  }
 
   private checkToken(bucket: string, p: string, mode: "upload" | "download", token: string): boolean {
     const [body, mac] = token.split(".");
@@ -223,6 +229,7 @@ export class Fakes {
           utterances: [], entities,
         };
       }
+      t.created = new Date().toISOString();
       this.transcripts.set(id, t);
       // AssemblyAI calls the webhook when the transcript is ready
       if (b.webhook_url) {
@@ -232,6 +239,15 @@ export class Fakes {
         }, 300);
       }
       return this.json(res, 200, { id, status: "queued" });
+    }
+    // list (the worker's orphan sweep): newest first, like AssemblyAI; deleted ones keep a placeholder audio_url
+    if (p === "/aai/v2/transcript" && req.method === "GET") {
+      this.listCalls++;
+      const rows = [...this.transcripts.values()].reverse().map((t) => ({
+        id: t.id, status: "completed", created: t.created as string,
+        audio_url: this.deleted.has(t.id) ? "http://deleted_by_user" : "https://storage.example/audio",
+      }));
+      return this.json(res, 200, { transcripts: rows.slice(0, 200), page_details: { prev_url: null } });
     }
     m = /^\/aai\/v2\/transcript\/([A-Za-z0-9_-]+)$/.exec(p);
     if (m) {
@@ -255,7 +271,10 @@ export class Fakes {
       this.llm.calls++;
       let content: unknown;
       if (schema === "pii_items") content = { items: [] };
-      else if (schema === "call_clips_coaching") content = this.coaching(user);
+      else if (schema === "call_clips_coaching") {
+        this.llm.systems.push(String(b.messages?.find((x: { role: string }) => x.role === "system")?.content ?? ""));
+        content = this.coaching(user);
+      }
       else return this.json(res, 400, { error: `unknown schema ${schema}` });
       return this.json(res, 200, { model: b.model, choices: [{ message: { content: JSON.stringify(content) }, finish_reason: "stop" }], usage: { cost: 0.0012 } });
     }

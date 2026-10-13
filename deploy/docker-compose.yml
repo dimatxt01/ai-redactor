@@ -1,0 +1,17 @@
+# ai-redactor on one host (e.g. Hetzner). `docker compose -f deploy/docker-compose.yml up -d --build`
+# Secrets: /etc/ai-redactor.env (root-only, chmod 600), never in git. One instance.
+services:
+  worker:
+    build: ..
+    image: ai-redactor:latest
+    restart: unless-stopped
+    env_file: /etc/ai-redactor.env
+    read_only: true            # the worker writes only to /tmp (temp files inside a step, the alive file)
+    tmpfs:
+      - /tmp:size=512m
+    stop_grace_period: 30s     # SIGTERM: running jobs fail as "worker restarted" and report their vendor copies
+    logging:                   # keep container logs short (they hold ids and counts only)
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

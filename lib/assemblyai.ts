@@ -77,3 +77,29 @@ export async function deleteTranscript(id: string): Promise<boolean> {
     return false;
   }
 }
+
+export type AaiListed = { id: string; status: string; created: string; audio_url?: string | null };
+
+/**
+ * This account's transcripts created before `olderThan` (and after `notBefore`), newest first, following the
+ * list API's prev_url pages. Used by the orphan sweep only. Throws on any failure (the sweep just retries later).
+ */
+export async function listTranscriptsBetween(notBefore: Date, olderThan: Date, maxPages = 20): Promise<AaiListed[]> {
+  const out: AaiListed[] = [];
+  let path: string | null = "/transcript?limit=200";
+  for (let page = 0; path && page < maxPages; page++) {
+    const res = await call(path);
+    if (!res.ok) throw new Error(`assemblyai list ${res.status}`);
+    const j = (await res.json()) as { transcripts?: AaiListed[]; page_details?: { prev_url?: string | null } };
+    const rows = j.transcripts ?? [];
+    for (const t of rows) {
+      const at = new Date(t.created).getTime();
+      if (at < olderThan.getTime() && at >= notBefore.getTime()) out.push(t);
+    }
+    // pages run newest → oldest; stop once a page reaches past the window
+    if (!rows.length || rows.some((t) => new Date(t.created).getTime() < notBefore.getTime())) break;
+    const prev: string | null = j.page_details?.prev_url ?? null;
+    path = prev ? prev.replace(/^https:\/\/api\.assemblyai\.com\/v2/, "") : null;
+  }
+  return out;
+}

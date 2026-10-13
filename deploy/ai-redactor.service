@@ -1,0 +1,24 @@
+# systemd alternative to Docker. Install: repo in /opt/ai-redactor, `npm ci --omit=dev` there, then
+#   cp deploy/ai-redactor.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now ai-redactor
+# Secrets: /etc/ai-redactor.env (root-only, chmod 600). Logs: journald (cap it: SystemMaxUse= / MaxRetentionSec= in journald.conf).
+[Unit]
+Description=ai-redactor (TrueRing Recording Library worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=airedactor
+WorkingDirectory=/opt/ai-redactor
+EnvironmentFile=/etc/ai-redactor.env
+ExecStartPre=/usr/bin/node --import tsx src/check.ts --bridge
+ExecStart=/usr/bin/node --import tsx src/worker.ts
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

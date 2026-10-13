@@ -1,4 +1,4 @@
-// Steps of the redaction workflow. Each step does its own I/O (bridge, vendors,
+// Steps of one redaction job (run in order by lib/job.ts). Each step does its own I/O (bridge, vendors,
 // ffmpeg) and passes ONLY non-PII values onward: ids, counts, hashes, millisecond
 // offsets, detector/type names. Transcripts and names live in TR's private
 // sample-src/<job_id>/ scratch prefix between steps and in local /tmp inside one step (removed in
@@ -11,7 +11,7 @@ import { deleteTranscript, getTranscript, submitTranscript, type AaiEntity } fro
 import { bridge, getWork, getWorkJson, putWork, signUrls, uploadSigned, downloadSigned, type JobInputs, type JobOptions } from "@/lib/bridge";
 import { cutClip, encodeMp3, probe, renderRedacted, writePcm, type PitchEngine } from "@/lib/audio";
 import { envelope, redactedLines, sha256, spansJson, transcriptJson, transcriptTxt, versionTag } from "@/lib/artifacts";
-import { CLIPS, LIMITS, MODELS, PIPELINE_VERSION, SCHEMA_VERSION } from "@/lib/config";
+import { CLIPS, LIMITS, MODELS, PIPELINE_VERSION, SCHEMA_VERSION, VERTICALS, type Vertical } from "@/lib/config";
 import { asrCostUsd, charge, guard, LLM_RESERVE } from "@/lib/cost";
 import { FatalError, jobError } from "@/lib/errors";
 import { clipAndCoach, type CallCoaching, type Clip, type RedactedLine } from "@/lib/labels";
@@ -32,6 +32,7 @@ export type Ctx = {
   options: Omit<JobOptions, "extra_terms">;
   durationS: number;
   channelMapVerified: boolean;
+  vertical: Vertical;
   jobCapUsd: number;
   asrUsdPerHour: number;
 };
@@ -67,6 +68,9 @@ export async function claimJob(jobId: string, runId: string, idempotencyKey: str
     }
     throw e;
   }
+  // TR always sets the vertical (from the call's agent) and refuses unknown ones; never guess it here
+  const vertical = inp.job.call_meta.vertical as Vertical;
+  if (!Object.hasOwn(VERTICALS, vertical)) throw jobError("internal", "job has no known vertical");
   // every redaction setting fails safe when TR's row lacks it (lib/options.ts)
   const options = normalizeOptions(inp.job.options, inp.job.call_meta.channel_map?.customer);
   log("job_claimed", { job_id: jobId, run_id: runId, version: inp.job.version, duration_s: inp.job.call_meta.duration_s });
@@ -80,6 +84,7 @@ export async function claimJob(jobId: string, runId: string, idempotencyKey: str
       options,
       durationS: Number(inp.job.call_meta.duration_s) || 0,
       channelMapVerified: inp.job.call_meta.channel_map?.verified === true,
+      vertical,
       jobCapUsd: inp.caps.job_usd,
       asrUsdPerHour: inp.caps.asr_usd_per_hour,
     },
@@ -284,6 +289,7 @@ export async function clipsAndCoaching(ctx: Ctx, src: Source, stepAttempt = 1) {
     guard(inp.caps.spent_usd, 2 * LLM_RESERVE, ctx.jobCapUsd, "LLM clips/coaching");
     const r = await clipAndCoach(lines, bleeps, src.durationMs, {
       maxClips: Math.min(CLIPS.maxPerCall, ctx.options.clips?.max_per_call ?? CLIPS.maxPerCall),
+      vertical: ctx.vertical,
       onCost: async (usd, attempt) => { await charge(ctx.jobId, ctx.runId, `llm:clips:s${stepAttempt}:a${attempt}`, usd); },
     });
     llmModel = r.model;

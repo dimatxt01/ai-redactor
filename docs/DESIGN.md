@@ -38,12 +38,10 @@ Paths below are in this repo; TrueRing-side files live under `truering/` at thei
    - The same digit-run, MBI and name checks run on **all coaching text** (`coaching_pii:…`).
 9. **complete**:
    - The bridge checks every file is in `training-library/<job_id>/`.
-   - `sample_library_ingest` then writes, in one transaction: the job as `done`, plus `training_library_calls` (`pending_qa`), `_call_sources` (with the agent's active `consent_id`) and `_clips`.
+   - `sample_library_ingest` then writes, in one transaction: the job as `done`, plus `training_library_calls` (`pending_qa`), `_call_sources` (`consent_id` stays NULL: no consent gate, Dmitry 12:44 PM) and `_clips`, with the job's vertical.
    - Scratch is emptied and AssemblyAI's transcripts are deleted.
 
-**Human gate.** RL-1's trigger allows publish only when the latest review is `approve` with `listened_full`, and the source agent's consent is active. `training-library-admin` adds two things on top:
-- The reviewer must have opened the full call **and every exported clip**; this is checked against the access log. The UI also unlocks the checkbox only after ≥98% continuous playback of each.
-- A taken-down call can never be published again (trigger `sample_redaction_takedown_guard`).
+**Human gate.** The publish gate allows publish only when the latest review is `approve` with `listened_full` (no consent check). On top of that, `training-library-admin` requires that the reviewer opened the full call **and every exported clip**, checked against the access log. The UI also unlocks the checkbox only after ≥98% continuous playback of each.
 
 Every JSON result is an envelope `{schema, schema_version: "1.0", pipeline_version, job_version, call_id, items}`, and every job row carries `schema_version` too. Audio carries `"<pipeline_version> job_v<n>"` in its ID3 comment.
 
@@ -61,7 +59,7 @@ Every JSON result is an envelope `{schema, schema_version: "1.0", pipeline_versi
 | Second pass on clips + coaching (§2.8) | `lib/qa.ts` `clipReasons`, `textPiiReasons`; step `verifySecondPass` |
 | Test fixtures (§7) | **The set:** 12 synthetic dual-channel calls in `fixtures/calls`, with planted fictional PII. They include crosstalk, spoken dashes, bank and card numbers, health details, objections, a 47-min call, a numbers-not-PII control and long numbers spoken as words. **Rule tests:** `npm test`. **Real vendors:** `npm run eval` checks for 0 leaks and that labels are stable across 3 reruns. |
 | Logs with no PII | `lib/log.ts` (ids and numbers only). Nothing the worker holds between steps is text: transcripts, clips and coaching live in TR's private `sample-src/<job_id>/` between steps. Errors keep only a code. |
-| Delete removes every copy | **Order:** the admin `delete {call_id}` sets the **tombstone first**, fails a running job, purges both buckets, and withdraws the library rows (kept as the take-down record, emptied of audio paths and generated text). **No vendor copy and no live run:** the job is `deleted` at once. **Otherwise:** the worker running it stops on its next poll, deletes its AssemblyAI copies and reports `vendor_purged`; the bridge then purges again and marks it `deleted`. **A dead worker:** after its heartbeat goes stale, any worker's poll gets the leftover ids in its cleanup list. |
+| Cancel and delete (TR side only) | **Cancel** (admin): TR sets the call's queued and running jobs to `failed: cancelled`. The worker sees them in its next poll's `stop` list and aborts. It doesn't call `fail`, purges, deletes its AssemblyAI copies and reports `vendor_purged`, which clears the heartbeat. **Delete** (admin): a hard delete in TR; the worker is never called. It is refused (`409 IN_FLIGHT`) while a job runs, a heartbeat is fresh, or AssemblyAI ids are still recorded. So the worker's vendor cleanup (end of job, the `cleanup` list for dead runs) is what unblocks it. Afterwards the bridge answers `404 NO_JOB`, which the worker treats as stopped (no `fail`, no report). **Orphans:** a transcript whose id never reached TR (a worker killed between submit and the `asr` record) is deleted by the worker's orphan sweep: anything on its dedicated AssemblyAI account older than 2 h 15 m. |
 
 ## Deliberate deviations from SPEC v0.2
 
@@ -85,7 +83,7 @@ Every JSON result is an envelope `{schema, schema_version: "1.0", pipeline_versi
 | B7 | Patch based on ef56fd65 | Rebased on main. The migration version is new (the old `20261012230000` collided with `wl_m3_operator_telephony_flag`). Manifest is 2026-10-12.3. |
 | N1 | Replay cache on `/api/delete` | Moot since the pull model: the worker has no endpoints. |
 | N2 | `/api/jobs` key vs job row | The bridge `claim` compares the key (`KEY_MISMATCH`); since the pull model the key also comes from the bridge itself. |
-| N3 | 207 handling | The job becomes `deleted` only after a 200 from the worker; on a 207 the UI offers delete again. |
+| N3 | 207 handling | Moot: there is no worker delete endpoint any more. TR refuses a delete until the worker has reported every AssemblyAI copy gone (`409 IN_FLIGHT`). |
 | N4 | `isQuantity` | Limited to runs ≤4 digits or said as an amount; regression tests cover the 11-digit spoken account number and the amounts. |
 | N5 | MBI | Comment on the upper-case matching; the spoken-dash MBI is in a regression test and fixture 05. |
 | N6 | Cap alert + estimate | ops-alert key `sample_cost_cap`. The admin and worker estimates use one formula (`lib/cost.ts` = `training-library-admin` `estimateJobUsd`). |
@@ -95,7 +93,7 @@ Also fixed: calls RLS limits an AM to their own book, so the pick list is server
 
 ## After the review: repo split (2026-10-13)
 
-The worker is its own repo (this one), deployed separately. TrueRing's branch `feat/sample-redaction` keeps only the TrueRing side; `truering/` here is a reference copy of that side (refreshed TrueRing → here with `refresh.sh`; never applied from here), and `check.sh` verifies a TrueRing checkout.
+The worker is its own repo (this one), deployed separately. TrueRing's side now lives on `Mahamadou2004/truering` `prb/rl-worker` (it replaced `feat/sample-redaction` / #348); `truering/` here is a mirror of it (refreshed TrueRing → here with `refresh.sh`; never applied from here), and `check.sh` verifies a TrueRing checkout.
 The end-to-end simulation (`npm run simulate`) found one worker defect, now fixed: a job row whose `options` lacked `bleep_pad_ms` produced NaN bleep intervals, i.e. nothing bleeped (the second pass did flag it). `lib/options.ts` now fails every redaction setting safe, with tests in `test/options.test.ts`.
 
 ## Review of 4f7ad9a (2026-10-13), item by item
@@ -118,7 +116,19 @@ Asked by Dmitry: "I was envisioning the service as just a node background worker
 - **Waiting on AssemblyAI.** The worker polls AssemblyAI's status with its own key, so there's no webhook. Detection, DSP, clips, coaching and QA in `lib/` are unchanged.
 - **Gone:** the Next.js routes `/api/jobs`, `/api/delete` and `/api/health`, the `purgeLater` timer runs, the Workflow event log and its retention setting, `vercel.json` and the Vercel project.
 - **Connection.** The worker calls the bridge's new `poll` action every 20 s. It holds no URL TrueRing calls, and needs one secret (`SAMPLE_REDACTOR_BRIDGE_SECRET`); `SAMPLE_REDACTOR_URL` and `SAMPLE_REDACTOR_START_SECRET` are gone.
-- **Liveness.** `heartbeat_at`, a new column in the staged migration, guarded like the other worker columns, is refreshed by every poll. A running job whose heartbeat is older than `SAMPLE_WORKER_STALE_S` (300) is failed by the bridge, with its files purged. Its vendor ids go to the next poll's cleanup list. A job's own run reports `vendor_purged` last, which ends its heartbeat and completes a takedown.
-- **Why no late re-purge any more.** The Workflow design re-purged 2h15m later because a retried step elsewhere could still upload. Here a job's steps run in one process and every upload is awaited, so when a run returns nothing of it is in flight. The bridge also purges again when it marks a takedown `deleted`.
+- **Liveness.** `heartbeat_at`, a new column in the staged migration, guarded like the other worker columns, is refreshed by every poll. A running job whose heartbeat is older than `SAMPLE_WORKER_STALE_S` (300) is failed by the bridge, with its files purged. Its vendor ids go to the next poll's cleanup list. A job's own run reports `vendor_purged` last, which ends its heartbeat (and is what lets TR delete the call).
+- **Why no late re-purge any more.** The Workflow design re-purged 2h15m later because a retried step elsewhere could still upload. Here a job's steps run in one process and every upload is awaited, so when a run returns nothing of it is in flight. TR's hard delete also purges both buckets before and after removing the rows.
 - **Restarts.** SIGTERM aborts running jobs, which fail as `internal: worker restarted` (the AM retries) and report their vendor copies before the process exits. SIGKILL is covered by the stale-heartbeat path.
-- **Proof** (`npm run simulate`, 96 checks): two workers racing, a takedown mid-run, a worker killed mid-run (the bridge fails it, the other worker cleans up, retry finishes it), and SIGTERM. A production-only install (`npm ci --omit=dev`, the Dockerfile's steps) passes the self-check. The Docker image itself was not built here, because Docker Desktop was waiting on a prompt.
+- **Proof** (`npm run simulate`, 96 checks at the time): two workers racing, a takedown mid-run (since replaced by cancel), a worker killed mid-run (the bridge fails it, the other worker cleans up, retry finishes it), and SIGTERM. A production-only install (`npm ci --omit=dev`, the Dockerfile's steps) passes the self-check. The Docker image itself was not built here, because Docker Desktop was waiting on a prompt.
+
+## 2026-10-13: aligned with TrueRing `prb/rl-worker` @ 1ea55f37 (cancel, hard delete, every vertical, no consent)
+
+The TrueRing side's source of truth is now `prb/rl-worker`; it merged #347/#349 and replaced #348. The mirror was refreshed from it (`truering/SOURCE`).
+- **Protocol unchanged.** Pull model, one HMAC direction, `poll` plus the per-job actions; `lib/bridge.ts` `Poll` matches.
+- **Cancel.** It reaches the worker through `poll` (`stop`); the existing sequence is kept exactly: abort as "stop", no `fail`, purge, delete the AssemblyAI copies, `vendor_purged`.
+- **Hard delete on TR's side.** A missing row answers `404 NO_JOB`. `lib/bridge.ts` maps it to a fatal `NO_JOB` error, and `lib/job.ts` treats it as stopped: no `fail`, no `purge`, no report. The worker still deletes its AssemblyAI copies. The cleanup path logs `cleanup_job_gone`. Tests: `test/bridge.test.ts`.
+- **Every vertical.** The job's `call_meta.vertical` (`final_expense` | `medicare` | `aca`, set by TR) is read at claim and never defaulted; an unknown one fails the job. The clips + coaching prompt names the job's line of insurance. Rubric `fe_v1` for all three until Dmitry rules on per-vertical rubrics.
+- **No consent.** The worker never touched consent; the docs and the simulation no longer mention it.
+- **New: AssemblyAI orphan sweep.** The new crash scenario showed it was needed: a worker killed between AssemblyAI's submit and the bridge `asr` record leaves a transcript whose id TR never learns. It would sit at the vendor forever, and it doesn't block a delete, since the row shows no ids. Every `ORPHAN_SWEEP_S` (1800) the worker lists its account's transcripts and deletes those older than `ORPHAN_AGE_S` (8100 = 2 h 15 m, past the 2 h job deadline), never touching ids of its own running jobs. This requires an AssemblyAI key used by this worker only. Tests: `test/assemblyai-list.test.ts`, plus a deterministic simulation case.
+- **Hosting.** `deploy/docker-compose.yml` (restart unless-stopped, read-only root, tmpfs `/tmp`, json-file log rotation) and `deploy/ai-redactor.service` (systemd, `Restart=always`, the self-check before every start). ffmpeg-static is per-architecture; `npm run check` runs on the host or inside the image.
+- **Proof.** `npm run simulate`, 102 checks: hard delete (admin only, rows and files gone, spend kept in the ledger, then `NO_JOB`); cancel mid-run → stop → `vendor_purged` → delete (refused while in flight); refusal of not-ended calls and of agents with two or no verticals; a Medicare call whose prompt names Medicare; the orphan sweep. TR-side checks (`truering/check.sh`) pass on `prb/rl-worker` @ 1ea55f37.

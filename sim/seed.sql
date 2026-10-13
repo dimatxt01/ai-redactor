@@ -6,6 +6,8 @@ CREATE TABLE public.call_dispositions (id uuid PRIMARY KEY DEFAULT gen_random_uu
 INSERT INTO public.call_dispositions (name) VALUES ('Sale'), ('No Sale');
 ALTER TABLE public.calls
   ADD COLUMN created_at timestamptz NOT NULL DEFAULT now(),
+  ADD COLUMN status text NOT NULL DEFAULT 'completed',
+  ADD COLUMN ended_at timestamptz,
   ADD COLUMN disposition_id uuid REFERENCES public.call_dispositions(id),
   ADD COLUMN recording_url text,
   ADD COLUMN telnyx_call_control_id text,

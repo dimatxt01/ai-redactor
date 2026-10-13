@@ -22,8 +22,6 @@ export type JobRow = {
   call_meta: { duration_s?: number; caller_state?: string | null; channel_map?: { customer: number; verified: boolean } };
   created_at: string;
   completed_at: string | null;
-  delete_requested_at: string | null;
-  deleted_at: string | null;
 };
 
 export type Scores = Partial<Record<"rapport" | "discovery" | "objections" | "close" | "compliance", number | null>>;
@@ -47,6 +45,7 @@ export type LibraryCall = {
   id: string;
   job_id: string | null;
   version: number;
+  vertical: string;
   agent_ref: string;
   duration_s: number | null;
   audio_path: string | null;
