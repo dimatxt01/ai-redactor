@@ -27,7 +27,9 @@ export type Span = {
 
 export type Interval = { start_ms: number; end_ms: number };
 
-// MBI after removing spaces/dashes (CMS format: 11 chars, no S L O I B Z).
+// MBI after removing spaces/dashes (CMS format: 11 chars, no S L O I B Z). Upper-case only on purpose:
+// it runs on Tok.chars, which spoken.ts already upper-cases (ASR gives "k" or "K" for a spelled letter),
+// so the spec's mixed-case class is not needed here; "dash"/"hyphen" words carry no chars and drop out.
 export const MBI_RE = /[1-9][AC-HJKMNP-RT-Y][AC-HJKMNP-RT-Y0-9][0-9][AC-HJKMNP-RT-Y][AC-HJKMNP-RT-Y0-9][0-9][AC-HJKMNP-RT-Y]{2}[0-9]{2}/g;
 
 const STREET = new Set([
@@ -86,7 +88,25 @@ const QUANTITY_NOUNS = new Set([
 const PER = new Set(["a", "per", "each", "every"]);
 const PERIOD = new Set(["month", "year", "week", "day", "monthly"]);
 
+/**
+ * The digit run t sits in (same channel, digit words < 800 ms apart). An amount is said with
+ * "hundred"/"thousand", a "$", "%" or comma grouping; anything else longer than 4 digits is an
+ * ID, whatever word follows it ("four four one two seven three nine nine eight one two days").
+ */
+function runIsAmountOrShort(t: Tok, toks: Tok[]): boolean {
+  const k = toks.findIndex((o) => o.i === t.i);
+  if (k < 0) return true;
+  let a = k, b = k;
+  while (a > 0 && toks[a - 1].digits && toks[a].start - toks[a - 1].end < 800) a--;
+  while (b + 1 < toks.length && toks[b + 1].digits && toks[b + 1].start - toks[b].end < 800) b++;
+  const run = toks.slice(a, b + 1);
+  if (run.reduce((n, o) => n + o.digits.length, 0) <= DIGIT_RUN.minDigits) return true;
+  return run.some((o) => o.w === "hundred" || o.w === "thousand" || o.w === "million" || o.w.startsWith("$") || o.w.endsWith("%")
+    || /^\$?\d{1,3}(,\d{3})+(\.\d+)?[.,]?$/.test(o.raw));
+}
+
 function isQuantity(t: Tok, toks: Tok[]): boolean {
+  if (!runIsAmountOrShort(t, toks)) return false;
   if (t.w.startsWith("$") || t.w.endsWith("%")) return true;
   if (/^\d{1,2}:\d{2}(am|pm)?$/.test(t.w)) return true;              // clock time
   const k = toks.findIndex((o) => o.ch === t.ch && o.i > t.i);

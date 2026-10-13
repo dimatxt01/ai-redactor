@@ -9,7 +9,8 @@ export type JobOptions = {
   bleep_pad_ms: number;
   pitch_shift_customer: boolean;
   redact_health: boolean;
-  highlight: { enabled: boolean; target_s: number };
+  clips: { enabled: boolean; max_per_call: number; min_s: number; max_s: number };
+  coaching: { enabled: boolean; rubric: "fe_v1" };
   extra_terms: string[];
   customer_channel: 0 | 1;
 };
@@ -24,7 +25,6 @@ export type JobInputs = {
     call_meta: {
       duration_s: number;
       disposition: string | null;
-      agent_ref: string;
       vertical: string;
       caller_state: string | null;
       channel_map: { customer: 0 | 1; agent: 0 | 1; verified: boolean };
@@ -33,6 +33,7 @@ export type JobInputs = {
     workflow_run_id: string | null;
   };
   extra_terms: string[];
+  idempotency_key: string;
   caps: { job_usd: number; month_usd: number; spent_usd: number; asr_usd_per_hour: number };
 };
 

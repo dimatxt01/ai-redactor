@@ -89,3 +89,36 @@ export function secondPassReasons(
   }
   return [...new Set(out)];
 }
+
+/**
+ * SPEC v0.2 §2.8, clips: every clip is a cut of the redacted full audio, so a second-pass hit
+ * inside a clip's window is a leak in that clip. Reported per clip (exported clips only: the
+ * others have no audio).
+ */
+export function clipReasons(secondPass: string[], clips: { clip_id: string; start_ms: number; end_ms: number; audio_exported: boolean }[]): string[] {
+  const out: string[] = [];
+  for (const r of secondPass) {
+    const m = /@(\d+)ms$/.exec(r);
+    if (!m) continue;
+    const t = Number(m[1]);
+    for (const c of clips) if (c.audio_exported && t >= c.start_ms && t <= c.end_ms) out.push(`second_pass_clip:${c.clip_id}:${r}`);
+  }
+  return [...new Set(out)];
+}
+
+/**
+ * SPEC v0.2 §2.7/2.8, coaching text: the same digit-run, MBI and name checks as the audio,
+ * over every string the model wrote. Text is treated as one run said at once.
+ */
+export function textPiiReasons(texts: { where: string; text: string }[], nameList: string[]): string[] {
+  const out: string[] = [];
+  for (const { where, text } of texts) {
+    const words: Word[] = text.split(/\s+/).filter(Boolean).map((w, i) => ({ i, text: w, start: i * 250, end: i * 250 + 200, conf: 1, ch: 0 }));
+    if (!words.length) continue;
+    const toks = tokenize(words);
+    if (digitRuns(words, toks).length) out.push(`coaching_pii:${where}:digit_run`);
+    if (mbiMatches(words, toks).length) out.push(`coaching_pii:${where}:mbi`);
+    if (termMatches(words, nameList, "PERSON_NAME", "extra_term").length) out.push(`coaching_pii:${where}:name`);
+  }
+  return [...new Set(out)];
+}

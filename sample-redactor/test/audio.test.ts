@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { cutHighlight, encodeMp3, pitchShiftPcm, probe, renderRedacted, writePcm, WORK_SR } from "@/lib/audio";
+import { cutClip, encodeMp3, pitchShiftPcm, probe, renderRedacted, writePcm, WORK_SR } from "@/lib/audio";
 
 let dir = "";
 beforeAll(async () => { dir = await mkdtemp(path.join(tmpdir(), "sr-audio-")); });
@@ -62,7 +62,7 @@ const SRC = path.join(import.meta.dirname, "..", "fixtures", "out", "01-classic-
     expect(r.sampleRate).toBe(44100);
 
     const hl = path.join(dir, "h.mp3");
-    await cutHighlight(mp3, hl, { start_ms: 5_000, end_ms: 65_000 }, "sr-test job_v1");
+    await cutClip(mp3, hl, { start_ms: 5_000, end_ms: 65_000 }, "sr-test job_v1");
     expect(Math.abs((await probe(hl)).durationMs - 60_000)).toBeLessThan(200);
   }, 60_000);
 });

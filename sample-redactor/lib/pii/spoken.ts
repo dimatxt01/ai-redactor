@@ -13,6 +13,7 @@ export type Tok = {
   w: string;            // normalized word
   digits: string;       // digits this word contributes ("" if none)
   chars: string;        // uppercase alphanumerics for ID matching (digits + spelled letters)
+  raw: string;          // the ASR word as written ("10,000"), for amount formatting checks
   letter: boolean;      // a spelled letter (single letter or phonetic)
 };
 
@@ -57,7 +58,7 @@ function wordDigits(w: string): string | null {
 
 export function tokenize(words: Word[]): Tok[] {
   // Work per channel so "oh" / "double" / "as in" only bind to the same speaker.
-  const toks: Tok[] = words.map((x) => ({ i: x.i, ch: x.ch, start: x.start, end: x.end, w: norm(x.text), digits: "", chars: "", letter: false }));
+  const toks: Tok[] = words.map((x) => ({ i: x.i, ch: x.ch, start: x.start, end: x.end, w: norm(x.text), digits: "", chars: "", letter: false, raw: x.text }));
   const byCh: Record<0 | 1, Tok[]> = { 0: [], 1: [] };
   for (const t of toks) byCh[t.ch].push(t);
 

@@ -3,10 +3,12 @@
   "version": "1.0.0",
   "scripts": {
     "dev": "next dev -p 3100",
+    "prebuild": "node scripts/check-ffmpeg.mjs",
     "build": "next build",
     "start": "next start -p 3100",
+    "pretest": "node scripts/check-ffmpeg.mjs",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --incremental false",
     "make-test-calls": "tsx scripts/make-test-calls.ts",
     "eval": "tsx scripts/eval-test-calls.ts",
     "validate": "bash scripts/validate.sh"

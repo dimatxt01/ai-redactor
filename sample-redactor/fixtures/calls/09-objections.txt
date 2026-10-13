@@ -1,0 +1,35 @@
+# Sales structure for clip labels: opener, rapport, discovery, budget, presentation, objections (price, think_about_it, spouse), close, application, wrap_up. Few planted values.
+# meta: agent=Lena Hartwell; caller=Russell Beaumont
+A: Hi, this is [[NAME:Lena]] calling about the final expense information you asked for. Is this [[NAME:Russell]]?
+C: Yeah, that's me. I filled out something online, I think.
+A: You did, and I appreciate you taking my call. How's your day going so far?
+C: Not bad. Just got back from walking the dog.
+A: Oh I love that. What kind of dog?
+C: A beagle. She runs the house, honestly.
+A: Beagles always do. So tell me, what got you thinking about coverage?
+C: My brother passed last spring and the family had to scramble to pay for the funeral. I don't want my wife going through that.
+A: I'm sorry about your brother. That's exactly why people call us. Do you have any coverage today?
+C: Just a small thing through my old job, but I don't think it's much.
+A: Okay. And what would feel comfortable for you each month, budget wise?
+C: I'm on a fixed income, so not a lot. Maybe forty or fifty dollars a month.
+A: That's a very common range. Here's what I can do. This plan pays out the full amount from day one, no waiting period, and the price never goes up.
+C: Never goes up?
+A: Locked in for life. And it can't be canceled because your health changes.
+C: Hmm. Honestly that sounds a little expensive for what it is.
+A: I hear you. Let me ask, if something happened next month, how would the family cover the funeral today?
+C: They'd probably have to put it on a credit card.
+A: And that's the bill this replaces. For less than a dollar and a half a day.
+C: I don't know. I'd like to think about it.
+A: Of course. What part do you want to think over, the price or the coverage itself?
+C: Mostly I want to talk to my wife first. She handles the bills.
+A: That makes sense. Is she home right now? I'm happy to explain it to both of you.
+C: She's in the kitchen. Hold on. Okay, she says if it's locked in, go ahead.
+A: Wonderful. Let's get you approved today. I just need a few details for the application.
+C: Alright.
+A: What's your date of birth?
+C: [[DOB:February ninth nineteen fifty one]].
+A: And the best phone number to reach you?
+C: [[PHONE:five five five, six two oh, one one seven three]].
+A: Thank you [[NAME:Russell]]. You're approved. The policy packet arrives in about a week. Any questions before I let you go?
+C: No, that was easier than I thought. Thanks [[NAME:Lena]].
+A: My pleasure. Enjoy the rest of your day and give the beagle a pat for me.

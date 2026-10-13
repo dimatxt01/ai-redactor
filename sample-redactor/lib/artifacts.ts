@@ -1,7 +1,7 @@
 // Result files. Every JSON result is an envelope stamped with the pipeline
 // version and the job version; audio carries the same tag in its ID3 comment.
 import { createHash } from "node:crypto";
-import { PIPELINE_VERSION } from "./config";
+import { PIPELINE_VERSION, SCHEMA_VERSION } from "./config";
 import type { RedactedLine } from "./labels";
 import { padSpan, type Interval, type Span } from "./pii/detect";
 import type { Transcript } from "./words";
@@ -11,6 +11,7 @@ export const sha256 = (b: Buffer | string) => createHash("sha256").update(b).dig
 
 export type Envelope<T> = {
   schema: string;
+  schema_version: string;
   pipeline_version: string;
   job_version: number;
   call_id: string;
@@ -18,7 +19,7 @@ export type Envelope<T> = {
 };
 
 export function envelope<T>(schema: string, jobVersion: number, callId: string, items: T): Envelope<T> {
-  return { schema, pipeline_version: PIPELINE_VERSION, job_version: jobVersion, call_id: callId, items };
+  return { schema, schema_version: SCHEMA_VERSION, pipeline_version: PIPELINE_VERSION, job_version: jobVersion, call_id: callId, items };
 }
 
 export const versionTag = (jobVersion: number) => `${PIPELINE_VERSION} job_v${jobVersion}`;

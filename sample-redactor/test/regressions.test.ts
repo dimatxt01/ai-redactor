@@ -90,6 +90,25 @@ describe("review regressions", () => {
     }
   });
 
+  it("review 2026-10-13: a long number said as words is bleeped even when a count noun follows", () => {
+    const t = script([[1, "it's four four one two seven three nine nine eight one two days"]]);
+    const spans = digitRuns(t.words);
+    for (const i of idx(t, "four", "seven", "eight")) expect(covered(spans, t, i)).toBe(true);
+    // amounts stay audible: comma grouping, "thousand", "$"
+    for (const line of ["the 10,000 plan", "ten thousand dollars of coverage", "about 25 50 a month"]) {
+      const u = script([[0, line]]);
+      expect({ line, hits: digitRuns(u.words).length }).toEqual({ line, hits: 0 });
+    }
+  });
+
+  it("review 2026-10-13: an MBI read with spoken dashes", () => {
+    // MBI matching drops separators and is case-insensitive (ASR may give lower-case letters)
+    const t = script([[1, "it's seven K D nine dash H A two dash W N five six"]]);
+    const spans = ruleSpans(t, []);
+    for (const i of idx(t, "seven", "dash", "six")) expect(covered(spans, t, i)).toBe(true);
+    expect(spans.some((s) => s.type === "MBI")).toBe(true);
+  });
+
   it("a single digit word longer than the window does not crash", () => {
     expect(digitRuns([w(0, "1234", 0, 9000, 0)])).toHaveLength(1);
   });

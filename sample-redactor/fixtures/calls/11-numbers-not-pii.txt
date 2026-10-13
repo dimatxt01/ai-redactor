@@ -1,0 +1,13 @@
+# Control: premiums, coverage amounts, counts, times and plan lengths that must NOT be bleeped, plus exactly one planted phone number.
+# strict
+# meta: agent=Dana Whitfield; caller=Mavis Okafor
+A: So the ten thousand dollar plan comes to $45.50 a month.
+C: And the bigger one?
+A: Fifteen thousand dollars of coverage is sixty two dollars a month.
+C: I have two kids and four grandkids, so maybe the bigger one.
+A: A lot of folks pick that. It's a 10 year plan for the rate lock, then it stays level.
+C: Can you call me back tomorrow at 3:30? Or after four o'clock.
+A: Sure. I have three slots open, so I'll take the 3:30 one.
+C: I take two pills a day, if that matters.
+A: It doesn't change the price. You'd pay about a dollar fifty a day.
+C: Okay. Call me at [[PHONE:five five five, three four oh, two two nine one]].

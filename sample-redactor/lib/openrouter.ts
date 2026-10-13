@@ -11,14 +11,24 @@ import { jobError } from "./errors";
 
 export type LlmResult<T> = { data: T; costUsd: number; model: string };
 
-export async function llmJson<S extends z.ZodType>(opts: {
+type LlmOpts<S extends z.ZodType> = {
   schemaName: string;
   schema: S;
   system: string;
   user: string;
   /** Called with usage.cost as soon as a response arrives — before validation — so failed attempts are billed too. */
   onCost?: (usd: number) => Promise<void>;
-}): Promise<LlmResult<z.infer<S>>> {
+};
+
+/** One call; schema failures are retried by the workflow step (RetryableError). */
+export async function llmJson<S extends z.ZodType>(opts: LlmOpts<S>): Promise<LlmResult<z.infer<S>>> {
+  const r = await llmJsonOnce(opts);
+  if (!r.ok) throw new RetryableError(`openrouter ${r.error.startsWith("non-json") ? r.error : "schema mismatch"}`, { retryAfter: "10s" });
+  return r;
+}
+
+/** One call; an invalid answer comes back as {ok:false} with the validation error, for a caller-driven retry. */
+export async function llmJsonOnce<S extends z.ZodType>(opts: LlmOpts<S>): Promise<(LlmResult<z.infer<S>> & { ok: true }) | { ok: false; error: string; costUsd: number; model: string }> {
   let res: Response;
   try {
     res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -31,6 +41,7 @@ export async function llmJson<S extends z.ZodType>(opts: {
       body: JSON.stringify({
         model: MODELS.llm,
         temperature: 0,
+        seed: 7,   // deterministic labels where the provider supports it (SPEC v0.2 §7)
         max_tokens: COST.llmMaxOutputTokens,
         provider: { zdr: true, data_collection: "deny", require_parameters: true },
         response_format: {
@@ -58,15 +69,17 @@ export async function llmJson<S extends z.ZodType>(opts: {
   const costUsd = Number(body.usage?.cost ?? 0) || 0;
   if (opts.onCost) await opts.onCost(costUsd);
   const content = body.choices?.[0]?.message?.content ?? "";
+  const model = body.model ?? MODELS.llm;
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
   } catch {
-    throw new RetryableError(`openrouter non-json (${body.choices?.[0]?.finish_reason ?? "?"})`, { retryAfter: "10s" });
+    return { ok: false, error: `non-json (${body.choices?.[0]?.finish_reason ?? "?"})`, costUsd, model };
   }
   const ok = opts.schema.safeParse(parsed);
-  if (!ok.success) throw new RetryableError("openrouter schema mismatch", { retryAfter: "10s" });
-  return { data: ok.data, costUsd, model: body.model ?? MODELS.llm };
+  // the issue paths/messages name schema fields only, never the model's text
+  if (!ok.success) return { ok: false, error: ok.error.issues.slice(0, 5).map((i) => `${i.path.join(".")}: ${i.message}`).join("; "), costUsd, model };
+  return { ok: true, data: ok.data, costUsd, model };
 }
 
 /** Strict-mode JSON schema: drop $schema and zod's safe-integer bounds, which some providers reject. */

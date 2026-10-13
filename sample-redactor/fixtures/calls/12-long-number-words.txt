@@ -1,0 +1,9 @@
+# Long numbers spoken as words in one breath: an account number and a 16-digit card read in groups of four. Both must be bleeped in full. Fictional values.
+# meta: agent=Owen Sadler; caller=Harriet Lumley
+A: [[NAME:Harriet]], which account should the draft come from?
+C: The account number is [[BANK:four four one two seven three nine nine eight one two]].
+A: Thank you. And the card for the backup payment?
+C: [[CARD:five five five five four four four four three three three three two two two two]].
+A: One more time, slowly please.
+C: [[CARD:five five five five, four four four four, three three three three, two two two two]].
+A: Perfect, that's on file now.

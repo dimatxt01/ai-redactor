@@ -1,0 +1,15 @@
+# Bank draft and card payment: routing, account, card number, expiry, CVV after "the three digits on the back". Fictional values (Fed example routing, Visa test card).
+# meta: agent=Monica Strand; caller=Elmer Fitzhugh
+A: [[NAME:Elmer]], how would you like to pay the premium?
+C: Take it out of my checking account, I guess.
+A: Sure. What's the routing number at the bottom of your check?
+C: [[BANK:oh two one oh oh oh oh two one]].
+A: And the account number right after it?
+C: [[BANK:eight eight three seven, two two nine, one oh five]].
+A: Thank you. Some folks like a card on file as a backup. Do you want to add one?
+C: Okay, put my Visa on there. It's [[CARD:four one one one one one one one one one one one one one one one]].
+A: And the expiration date?
+C: [[CARD_EXPIRY:eleven twenty eight]].
+A: And the three digits on the back?
+C: [[CVV:four seven two]].
+A: You're all set. The first draft goes out when the policy starts.

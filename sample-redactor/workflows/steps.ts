@@ -9,18 +9,18 @@ import path from "node:path";
 import { FatalError, getStepMetadata } from "workflow";
 import { deleteTranscript, getTranscript, submitTranscript, type AaiEntity } from "@/lib/assemblyai";
 import { bridge, getWork, getWorkJson, putWork, signUrls, uploadSigned, downloadSigned, type JobInputs, type JobOptions } from "@/lib/bridge";
-import { cutHighlight, encodeMp3, probe, renderRedacted, writePcm, type PitchEngine } from "@/lib/audio";
+import { cutClip, encodeMp3, probe, renderRedacted, writePcm, type PitchEngine } from "@/lib/audio";
 import { envelope, redactedLines, sha256, spansJson, transcriptJson, transcriptTxt, versionTag } from "@/lib/artifacts";
-import { LIMITS, MODELS, PIPELINE_VERSION } from "@/lib/config";
+import { CLIPS, LIMITS, MODELS, PIPELINE_VERSION, SCHEMA_VERSION } from "@/lib/config";
 import { asrCostUsd, charge, guard, LLM_RESERVE } from "@/lib/cost";
 import { jobError } from "@/lib/errors";
-import { labelCall, snapHighlight, type RedactedLine } from "@/lib/labels";
+import { clipAndCoach, type CallCoaching, type Clip, type RedactedLine } from "@/lib/labels";
 import { log } from "@/lib/log";
 import {
   AAI_ENTITY_MAP, bleepIntervals, dedupe, entitySpans, nameTerms, ruleSpans, termMatches, totalMs, type Interval, type Span,
 } from "@/lib/pii/detect";
 import { llmPiiSpans } from "@/lib/pii/llm";
-import { avgConfidence, crosstalk, firstPassReasons, secondPassReasons } from "@/lib/qa";
+import { avgConfidence, clipReasons, crosstalk, firstPassReasons, secondPassReasons, textPiiReasons } from "@/lib/qa";
 import { fromAssemblyAi, type Transcript } from "@/lib/words";
 
 export type Ctx = {
@@ -40,6 +40,8 @@ export type Source = { durationMs: number; channels: number; sampleRate: number;
 type Pass1 = { transcript: Transcript; entities: AaiEntity[] };
 type SpansFile = { spans: Span[]; bleeps: Interval[] };
 type NamesFile = { names: string[] };
+// scratch only: clip windows + generated text, read back by verify and complete (never in step I/O)
+type ClipsFile = { clips: (Clip & { audio: { name: string; sha256: string } | null })[]; coaching: CallCoaching | null };
 
 async function scratch(jobId: string): Promise<string> {
   const dir = path.join(tmpdir(), `sr-${jobId}-${process.pid}-${Date.now()}`);
@@ -52,11 +54,12 @@ async function inputs(ctx: Ctx): Promise<JobInputs> {
 }
 
 // ── 1. claim ────────────────────────────────────────────────────────────────
-export async function claimJob(jobId: string, runId: string): Promise<{ duplicate: true } | { duplicate: false; ctx: Ctx }> {
+export async function claimJob(jobId: string, runId: string, idempotencyKey: string): Promise<{ duplicate: true } | { duplicate: false; ctx: Ctx }> {
   "use step";
   const inp = await bridge<JobInputs>("job", { job_id: jobId });
   try {
-    await bridge("claim", { job_id: jobId, run_id: runId });
+    // the bridge refuses a start whose key is not this job's key
+    await bridge("claim", { job_id: jobId, run_id: runId, idempotency_key: idempotencyKey });
   } catch (e) {
     if (e instanceof Error && e.message.startsWith("DUPLICATE_RUN")) {
       log("job_duplicate_run", { job_id: jobId, run_id: runId });
@@ -104,7 +107,7 @@ export async function fetchSource(ctx: Ctx): Promise<Source> {
     try { p = await probe(file); } catch { throw jobError("bad_audio", "not a readable audio file"); }
     if (p.channels !== 2) throw jobError("bad_audio", `expected 2 channels (one per leg), got ${p.channels}`);
     if (p.durationMs > LIMITS.maxCallSeconds * 1000 * (1 + LIMITS.durationTolerance)) {
-      throw jobError("bad_audio", `recording is ${Math.round(p.durationMs / 60000)} min; limit is 60`);
+      throw jobError("bad_audio", `too_long: recording is ${Math.round(p.durationMs / 60000)} min; limit is 60`);
     }
     const expected = ctx.durationS * 1000;
     const lengthOk = expected > 0 && Math.abs(p.durationMs - expected) <= expected * LIMITS.durationTolerance;
@@ -273,52 +276,89 @@ export async function writeTranscriptArtifacts(ctx: Ctx, src: Source) {
   };
 }
 
-// ── 7. labels, coaching, highlight ──────────────────────────────────────────
-export async function labelAndHighlight(ctx: Ctx, src: Source) {
+// ── 7. smart clips + coaching (SPEC v0.2 §2.6–2.7) ──────────────────────────
+export async function clipsAndCoaching(ctx: Ctx, src: Source) {
   "use step";
-  const attempt = getStepMetadata().attempt;
+  const stepAttempt = getStepMetadata().attempt;
   const inp = await inputs(ctx);
   const lines = await getWorkJson<RedactedLine[]>(ctx.jobId, ctx.runId, "redacted-lines.json");
   const { bleeps } = await getWorkJson<SpansFile>(ctx.jobId, ctx.runId, "spans.json");
   if (!lines.length) throw jobError("asr_failed", "no utterances to label");
+  const want = { clips: ctx.options.clips?.enabled !== false, coaching: ctx.options.coaching?.enabled !== false };
 
-  guard(inp.caps.spent_usd, LLM_RESERVE, ctx.jobCapUsd, "LLM labels/coaching");
-  const r = await labelCall(lines, ctx.options.highlight.target_s, async (usd) => {
-    await charge(ctx.jobId, ctx.runId, `llm:labels:a${attempt}`, usd);
-  });
+  let clips: Clip[] = [];
+  let coaching: CallCoaching | null = null;
+  const reasons: string[] = [];
+  let llmModel = "";
+  if (want.clips || want.coaching) {
+    guard(inp.caps.spent_usd, 2 * LLM_RESERVE, ctx.jobCapUsd, "LLM clips/coaching");
+    const r = await clipAndCoach(lines, bleeps, src.durationMs, {
+      maxClips: Math.min(CLIPS.maxPerCall, ctx.options.clips?.max_per_call ?? CLIPS.maxPerCall),
+      onCost: async (usd, attempt) => { await charge(ctx.jobId, ctx.runId, `llm:clips:s${stepAttempt}:a${attempt}`, usd); },
+    });
+    llmModel = r.model;
+    if (r.ok) {
+      clips = r.clips;
+      coaching = r.coaching;
+      reasons.push(...r.dropped);
+      if (r.attempts > 1) log("labels_retried", { job_id: ctx.jobId });
+    } else {
+      // SPEC v0.2 §7: still invalid after one retry => flag it, never return free-form labels
+      reasons.push("labels_invalid");
+      log("labels_invalid", { job_id: ctx.jobId });
+    }
+    if (!want.clips) {
+      clips = [];
+      if (coaching) coaching = { ...coaching, turning_point_clip_id: null };
+    }
+    if (!want.coaching) {
+      coaching = null;
+      clips = clips.map((c) => ({ ...c, coaching: { did: "", worked: "", improve: "", key_lines: [], scores: c.coaching.scores } }));
+    }
+  }
 
-  const hl = ctx.options.highlight.enabled ? snapHighlight(r.highlight, bleeps, src.durationMs) : null;
-  const lj = JSON.stringify(envelope("tr.sample.labels", ctx.version, ctx.callId, { segments: r.segments, highlight: hl }), null, 1);
-  const cj = JSON.stringify(envelope("tr.sample.coaching", ctx.version, ctx.callId, r.coaching), null, 1);
-  const urls = await signUrls(ctx.jobId, ctx.runId, [
-    { target: "library", name: "labels.json", mode: "upload" },
-    { target: "library", name: "coaching.json", mode: "upload" },
-    ...(hl ? [{ target: "library" as const, name: "redacted.mp3", mode: "download" as const }, { target: "library" as const, name: "highlight.mp3", mode: "upload" as const }] : []),
-  ]);
-  await uploadSigned(urls["library:labels.json:upload"], lj, "application/json");
-  await uploadSigned(urls["library:coaching.json:upload"], cj, "application/json");
-
-  let highlight: { name: string; sha256: string; start_ms: number; end_ms: number } | null = null;
-  if (hl) {
+  // cut the exported clips from the redacted audio
+  const exported = clips.filter((c) => c.audio_exported);
+  const withAudio: ClipsFile["clips"] = clips.map((c) => ({ ...c, audio: null }));
+  if (exported.length) {
+    const urls = await signUrls(ctx.jobId, ctx.runId, [
+      { target: "library", name: "redacted.mp3", mode: "download" },
+      ...exported.map((c) => ({ target: "library" as const, name: `clips/${c.clip_id}.mp3`, mode: "upload" as const })),
+    ]);
     const dir = await scratch(ctx.jobId);
     try {
-      const inFile = path.join(dir, "redacted.mp3"), outFile = path.join(dir, "highlight.mp3");
+      const inFile = path.join(dir, "redacted.mp3");
       await writeFile(inFile, await downloadSigned(urls["library:redacted.mp3:download"]));
-      await cutHighlight(inFile, outFile, hl, versionTag(ctx.version));
-      const bytes = await readFile(outFile);
-      await uploadSigned(urls["library:highlight.mp3:upload"], bytes, "audio/mpeg");
-      highlight = { name: "highlight.mp3", sha256: sha256(bytes), start_ms: hl.start_ms, end_ms: hl.end_ms };
+      for (const c of exported) {
+        const outFile = path.join(dir, `${c.clip_id}.mp3`);
+        await cutClip(inFile, outFile, c, versionTag(ctx.version));
+        const bytes = await readFile(outFile);
+        await uploadSigned(urls[`library:clips/${c.clip_id}.mp3:upload`], bytes, "audio/mpeg");
+        withAudio.find((x) => x.clip_id === c.clip_id)!.audio = { name: `clips/${c.clip_id}.mp3`, sha256: sha256(bytes) };
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   }
-  log("labelled", { job_id: ctx.jobId, segments: r.segments.length, highlight: !!highlight });
+
+  const cj = JSON.stringify(envelope("tr.training.clips", ctx.version, ctx.callId, clips), null, 1);
+  const kj = JSON.stringify(envelope("tr.training.coaching", ctx.version, ctx.callId, coaching), null, 1);
+  const urls = await signUrls(ctx.jobId, ctx.runId, [
+    { target: "library", name: "clips.json", mode: "upload" },
+    { target: "library", name: "coaching.json", mode: "upload" },
+  ]);
+  await uploadSigned(urls["library:clips.json:upload"], cj, "application/json");
+  await uploadSigned(urls["library:coaching.json:upload"], kj, "application/json");
+  await putWork(ctx.jobId, ctx.runId, "clips-meta.json", JSON.stringify({ clips: withAudio, coaching } satisfies ClipsFile), "application/json");
+
+  log("clips_done", { job_id: ctx.jobId, clips: clips.length, exported: exported.length, coaching: !!coaching, reasons: reasons.length });
   return {
-    labels_json: { name: "labels.json", sha256: sha256(lj) },
-    coaching_json: { name: "coaching.json", sha256: sha256(cj) },
-    highlight_audio: highlight,
-    llmModel: r.model,
-    highlightReason: ctx.options.highlight.enabled && !hl ? "highlight_no_valid_window" : null,
+    clips_json: { name: "clips.json", sha256: sha256(cj) },
+    coaching_json: { name: "coaching.json", sha256: sha256(kj) },
+    clipCount: clips.length,
+    exportedCount: exported.length,
+    llmModel,
+    reasons,
   };
 }
 
@@ -335,8 +375,22 @@ export async function verifySecondPass(ctx: Ctx, id: string): Promise<string[]> 
   const types = ctx.options.redact_health
     ? PII_ENTITY_TYPES
     : new Set([...PII_ENTITY_TYPES].filter((k) => !String(AAI_ENTITY_MAP[k]).endsWith("_OPT")));
-  const reasons = secondPassReasons(t2, bleeps, names, raw.entities ?? [], types);
-  log("second_pass", { job_id: ctx.jobId, words: t2.words.length, hits: reasons.length });
+  const full = secondPassReasons(t2, bleeps, names, raw.entities ?? [], types);
+  // SPEC v0.2 §2.8: the same checks on every clip and on all coaching text
+  const { clips, coaching } = await getWorkJson<ClipsFile>(ctx.jobId, ctx.runId, "clips-meta.json");
+  const texts: { where: string; text: string }[] = [];
+  if (coaching) {
+    texts.push({ where: "call.summary", text: coaching.summary });
+    coaching.strengths.forEach((t, i) => texts.push({ where: `call.strengths.${i}`, text: t }));
+    coaching.improvements.forEach((t, i) => texts.push({ where: `call.improvements.${i}`, text: t }));
+  }
+  for (const c of clips) {
+    for (const k of ["did", "worked", "improve"] as const) texts.push({ where: `${c.clip_id}.${k}`, text: c.coaching[k] });
+    c.coaching.key_lines.forEach((t, i) => texts.push({ where: `${c.clip_id}.key_lines.${i}`, text: t }));
+    texts.push({ where: `${c.clip_id}.title`, text: c.title });
+  }
+  const reasons = [...full, ...clipReasons(full, clips), ...textPiiReasons(texts, names)];
+  log("second_pass", { job_id: ctx.jobId, words: t2.words.length, hits: full.length, total: reasons.length });
   return reasons;
 }
 
@@ -349,17 +403,24 @@ export async function completeJob(ctx: Ctx, payload: {
 }) {
   "use step";
   const artifacts = Object.fromEntries(Object.entries(payload.artifacts).filter(([, v]) => v));
-  await bridge("complete", {
+  const { clips, coaching } = await getWorkJson<ClipsFile>(ctx.jobId, ctx.runId, "clips-meta.json");
+  const r = await bridge<{ library_call_id: string }>("complete", {
     job_id: ctx.jobId,
     run_id: ctx.runId,
     pipeline_version: PIPELINE_VERSION,
+    schema_version: SCHEMA_VERSION,
     qa_flag: payload.qaReasons.length > 0,
     qa_reasons: payload.qaReasons,
     metrics: payload.metrics,
     engine: payload.engine,
     artifacts,
+    coaching: coaching ?? {},
+    clips: clips.map((c) => ({
+      clip_id: c.clip_id, label: c.label, sub_label: c.sub_label, start_ms: c.start_ms, end_ms: c.end_ms,
+      audio_exported: c.audio_exported && !!c.audio, audio: c.audio, title: c.title, coaching: c.coaching, confidence: c.confidence,
+    })),
   });
-  log("job_done", { job_id: ctx.jobId, qa_flag: payload.qaReasons.length > 0, reasons: payload.qaReasons.length });
+  log("job_done", { job_id: ctx.jobId, library_call_id: r.library_call_id, qa_flag: payload.qaReasons.length > 0, reasons: payload.qaReasons.length });
 }
 
 /**

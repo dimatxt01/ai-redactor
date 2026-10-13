@@ -1,6 +1,6 @@
-# True Ring: Recording Redaction Service, spec v0.1 (2026-10-12)
+# True Ring: Recording Redaction + Coaching Service, spec v0.2 (2026-10-12, revised after Dmitry's 6:27 PM answers)
 
-This is an external service that Dmitry builds separately (n8n plus models via OpenRouter or a speech API). True Ring (TR) sends it calls privately; it returns PII-bleeped audio and transcripts; TR admins approve results into a sample library.
+This is an external service that Dmitry builds separately (n8n plus models via OpenRouter or a speech API). True Ring (TR) sends it calls privately; it returns PII-bleeped audio and transcripts; TR AMs/admins pick sales calls and, after a human QA listen, publish the results to an internal **training** Recording Library (smart clips of the key sale moments plus AI coaching notes).
 Status: draft. Based on read-only prod/repo scoping on 2026-10-12. Nothing built.
 
 ## 1. Input contract (from real data)
@@ -50,8 +50,9 @@ Sample submit payload:
   },
   "options": {
     "bleep_pad_ms": 250,
-    "pitch_shift_customer": true,
-    "highlight": { "enabled": true, "target_s": 300 },
+    "pitch_shift_customer": false,
+    "clips": { "enabled": true, "max_per_call": 6, "min_s": 20, "max_s": 240 },
+    "coaching": { "enabled": true, "rubric": "fe_v1" },
     "extra_terms": ["<agent first/last name>", "<carrier names>"]
   },
   "callback_url": "https://<project>.supabase.co/functions/v1/sample-redaction-callback"
@@ -81,16 +82,21 @@ Sample submit payload:
    - Replace each span with a 1 kHz tone at -12 dBFS, padded **250 ms** each side (allowed range 200–300 ms).
    - Merge spans less than 500 ms apart.
    - Apply the bleep on **both channels** at the same time, because the read-back echo also leaks.
-5. **Optional pitch-shift** of the customer channel (±2–3 semitones, formant-preserving if possible), then mix down to mono.
-6. **Optional highlight clip:**
-   - The LLM picks a 3–8 min window: opener → objection → close.
-   - It must not start or end inside a bleep, and gets a 1 s fade.
-   - It is cut from the already-redacted audio.
-7. **Second pass:**
+5. **Optional pitch-shift** of the customer channel (±2–3 semitones; default **off** for internal training), then mix down to mono.
+6. **Smart clips (segmentation):**
+   - An LLM (via OpenRouter; text only) reads the timestamped, already-redacted transcript and labels segments from a fixed set: `opener`, `rapport`, `discovery` (health/needs), `budget`, `presentation` (quote/benefits), `objection` (with sub-label, e.g. `price`, `think_about_it`, `spouse`), `close` (ask/commitment), `application` (data capture), `wrap_up`.
+   - Each segment snaps to sentence boundaries, gets a 1 s fade, and must not start or end inside a bleep. There are 20–240 s per clip and at most 6 clips per call.
+   - Segments are cut from the **redacted** audio only.
+   - The `application` segment is the densest in PII. Default: label it but **do not export audio** (`audio_exported:false`), coaching text only.
+7. **Coaching notes:**
+   - **Per clip:** what the agent did, what worked, what to improve, a quote of 1–2 key lines (redacted text), and a score of 1–5 on a fixed rubric (`fe_v1`: rapport, discovery depth, objection handling, assumptive close, compliance language).
+   - **Per call:** the outcome (`Sale`), a 3–5 sentence summary of how the sale went, top 3 strengths, top 3 improvements, overall rubric scores, and the key turning point (with clip reference).
+   - Coaching is generated from the redacted transcript only and must not invent or restore PII. The output is checked by the same regex pass as step 8.
+8. **Second pass:**
    - Transcribe the *redacted* audio again.
-   - Rerun the digit-run and MBI checks and the name list.
+   - Rerun the digit-run and MBI checks and the name list, on the full redacted audio, every clip, and all coaching text.
    - Any hit → `qa_flag=true`, with the reasons listed.
-8. **QA flag** is also set when:
+9. **QA flag** is also set when:
    - average word confidence is under 0.85;
    - any PII span has confidence under 0.7;
    - crosstalk is over 10%;
@@ -99,7 +105,9 @@ Sample submit payload:
 
 ## 3. Output contract
 
-- **Audio:** `redacted.mp3` (mono, 44.1 kHz/128 kbps for playback) and optionally `highlight.mp3`. Optionally a lossless `redacted.wav` for QA.
+- **Audio:** `redacted.mp3` (full call, mono, 44.1 kHz/128 kbps) for QA, plus `clips/<n>.mp3` for each exported clip. Optionally a lossless `redacted.wav` for QA.
+- **Clips:** `clips.json` = `[{clip_id, label, sub_label, start_ms, end_ms, audio_exported, title, coaching:{did, worked, improve, key_lines[], scores{}}, confidence}]`.
+- **Coaching:** `coaching.json` = `{summary, strengths[], improvements[], scores{rapport,discovery,objections,close,compliance}, turning_point_clip_id, rubric:"fe_v1", model}`.
 - **Transcript:** JSON of `[{channel, speaker:"customer"|"agent", start_ms, end_ms, text}]`. Redacted words appear as `[REDACTED:<TYPE>]`. A `.txt` render is also provided.
 - **PII spans:** `[{type, start_ms, end_ms, channel, confidence, detector:"model"|"regex"|"digit_run"|"extra_term", padded_start_ms, padded_end_ms}]`. They contain **no original text**.
 - **Status:** `queued` → `fetching` → `transcribing` → `redacting` → `verifying` → `done` | `failed` (with `error_code`: `fetch_expired` | `bad_audio` | `asr_failed` | `timeout`).
@@ -113,10 +121,17 @@ Callback (POST to `callback_url`):
   "status": "done",
   "qa_flag": true,
   "qa_reasons": ["second_pass_digit_run@612340ms"],
-  "metrics": { "asr_confidence": 0.91, "pii_spans": 37, "bleeped_ms": 18450, "duration_ms": 764000 },
+  "metrics": { "asr_confidence": 0.91, "clips": 6, "pii_spans": 37, "bleeped_ms": 18450, "duration_ms": 764000 },
   "artifacts": {
     "redacted_audio": { "url": "<signed, 24h>", "sha256": "…", "bytes": 12345678 },
-    "highlight_audio": { "url": "<signed, 24h>", "sha256": "…", "start_ms": 301000, "end_ms": 586000 },
+    "clips": [
+      { "clip_id": "c1", "label": "opener", "start_ms": 2100, "end_ms": 48300, "audio_exported": true,
+        "url": "<signed, 24h>", "sha256": "…", "title": "Warm opener, sets agenda",
+        "coaching": { "did": "…", "worked": "…", "improve": "…", "scores": { "rapport": 4 } } },
+      { "clip_id": "c4", "label": "objection", "sub_label": "price", "start_ms": 612000, "end_ms": 741500, "audio_exported": true, "url": "<signed, 24h>", "sha256": "…", "coaching": { "…": "…" } },
+      { "clip_id": "c6", "label": "application", "start_ms": 1490000, "end_ms": 1820000, "audio_exported": false, "coaching": { "…": "…" } }
+    ],
+    "coaching_json": { "url": "<signed, 24h>", "sha256": "…" },
     "transcript_json": { "url": "<signed, 24h>", "sha256": "…" },
     "pii_spans_json": { "url": "<signed, 24h>", "sha256": "…" }
   },
@@ -146,32 +161,33 @@ Callback (POST to `callback_url`):
 
 **Proposed TR tables (not created):**
 - `sample_redaction_jobs`: id, call_id, idempotency_key unique, status, qa_flag, qa_reasons jsonb, metrics jsonb, engine jsonb, submitted_by, timestamps.
-- `sample_library`:
-  - id, call_id, job_id, version, agent_ref, vertical, disposition, duration_s;
-  - storage paths and sha256 values, highlight bounds;
-  - title, tags;
-  - `status` (`pending_qa` | `qa_passed` | `legal_approved` | `published` | `rejected` | `withdrawn`).
-- `sample_library_approvals`: append-only `(library_id, step, actor, decision, notes, listened_full bool, at)`. **Publishing requires `qa` + `legal` with `listened_full=true`.**
-- Manifest: a view or export joining the three tables (call_id, agent_ref, consent ref, approvals, hashes), used for audits and take-downs.
+- `training_library_calls`: id, call_id, job_id, version, agent_ref (pseudonym), source_agent_id (admin-only column), vertical, duration_s, full-audio path and sha256, `coaching` jsonb, title, tags, `status` (`pending_qa` | `published` | `rejected` | `withdrawn`).
+- `training_library_clips`: id, library_call_id, label, sub_label, start_ms, end_ms, audio path (nullable when not exported), sha256, title, `coaching` jsonb, sort order.
+- `training_library_reviews`: append-only `(library_call_id, reviewer, decision, listened_full bool, notes, at)`. **Publishing requires one QA review with `listened_full=true`** (full call plus every clip).
+- `training_library_ratings`:
+  - Columns: id, agent_id, item_type (`call` | `clip`), item_id, `vote smallint check (vote in (-1,1))` (+1 = green up arrow, -1 = red down arrow), comment text (optional, ≤1000 chars), created_at, updated_at.
+  - Unique `(agent_id, item_type, item_id)`, so a repeat rating is an upsert.
+  - RLS: an agent can select/insert/update only rows where `agent_id = auth.uid()`; AM/admin can select all. No delete for agents (they can edit instead).
+  - Internal record only. **Never shown to other agents**: no aggregates in the agent UI. This table is TR-side only; the service never sees it.
+- Manifest: a view joining the above with consent refs and hashes, for audits and withdrawal.
 
-**Admin UI (`/admin/sample-library`):**
-- A picker filtered by disposition, agent, duration 10–40 min and vertical `final_expense`. Submit is a button.
-- A jobs list with status.
-- A QA player: waveform with bleeps marked, the redacted transcript, the second-pass flags, a "listened to the full file" checkbox, and approve/reject.
-- A library grid, with publish limited to internal share links, plus withdraw.
+**UI** (see TR_PLAN.md): an AM/admin curation page (pick, submit, status, QA listen, publish/withdraw) and a read-only **Recording Library** tab for agents (clip list by label, player, coaching notes).
 
-## 5. Security and compliance
+## 5. Security and compliance (internal training only)
 
-- **v1 scope:** Final Expense `Sale` calls only. **Medicare and ACA are excluded**, because of CMS marketing-material rules and health information.
-- **Agent consent:** a signed release from each featured agent, with `consent_ref` stored on the library row. Agent names are bleeped and pseudonymized as `agent_ref`.
-- **Customer:** pitch-shift on by default; health conditions and beneficiaries bleeped. Callers were told about recording, not about reuse in sales material, so legal must sign off before any external use. About 11–12 US states require every party to agree to recording; decide whether to exclude callers from those states.
-- **Human QA:** every file gets a full listen. One miss is a privacy incident. Do the internal-only pilot of 5 first.
+- **Scope:** Final Expense `Sale` calls only, confirmed by Dmitry. Medicare and ACA are excluded.
+- **Use:** internal training for logged-in TR agents, AMs and admins only. No marketing, public or buyer-facing use. That removes the CMS marketing-material question, the external legal approval of each item, and the public player. If use ever becomes external, the old marketing controls come back.
+- **Still required:**
+  - **PII redaction + a human QA listen of every published full call and clip.** One miss exposes a consumer's PII to the whole agent base.
+  - **Agent consent:** a featured agent's voice and performance are shown to peers and coached on. Get a one-time training-use release (portal checkbox), revocable; revoking withdraws their items. Agent names are bleeped and shown as pseudonyms.
+  - **Caller side:** callers were told calls are recorded; internal training/quality use usually fits that disclosure. Confirm the actual disclosure wording once (one-time review, not per item). Exclude calls from all-party consent states if the disclosure wording does not clearly cover training.
+  - **Health details:** bleep conditions and medications in the audio. The `application` clip has no audio by default.
+  - **Access:** RLS-gated, short signed links, no downloads in the UI, access logged.
 - **Retention:**
-  - Service: source and artifacts deleted ≤7 days after the callback.
+  - Service: copies deleted ≤7 days after the callback.
   - TR `sample-src` copies: deleted after the job finishes.
-  - Library: reviewed every 12 months, withdrawn on request.
-- **Vendors:** only vendors that don't train on the data and keep nothing (zero retention), with a data agreement in place. OpenRouter only with providers that keep no data, and **only on transcript text, never audio**.
-- **No public URLs; access is logged.**
+  - Library: reviewed every 12 months; withdrawn on agent revoke or a consumer request.
+- **Vendors:** zero data retention, no training on the data. LLM calls get transcript text only, never audio.
 
 ## 6. n8n feasibility
 
@@ -180,7 +196,7 @@ Callback (POST to `callback_url`):
 - HTTP Request node: download the binary, then call AssemblyAI/Deepgram.
 - Wait node or polling loop: wait for the async speech-to-text result, or use the vendor's own webhook.
 - Code node: regex, digit runs and span merging.
-- OpenRouter: an HTTP or AI node for the entity check and highlight picking.
+- OpenRouter: an HTTP or AI node for the entity check, clip segmentation and coaching.
 - HTTP Request: the signed callback.
 - Postgres or Data Table: job state.
 
@@ -190,10 +206,57 @@ Callback (POST to `callback_url`):
 - **Timeouts:** speech-to-text for a 40-min call takes minutes. Use async with a vendor webhook or Wait-node polling, never a blocking HTTP call. Raise `EXECUTIONS_TIMEOUT`.
 - **n8n Cloud:** limits on executions and binary size, and no Execute Command, so **self-hosted is recommended**.
 - **Retries and idempotency:** store them in the DB yourself; n8n's retry-on-fail alone is not enough.
+- **Clips and coaching:** one LLM call per call (segmentation + coaching JSON with a schema check in a Code node), then an ffmpeg cut per clip. This adds about 1–2 min per call.
 - **Recommended shape:** n8n for orchestration, AssemblyAI (audio redaction built in) or Deepgram plus an ffmpeg worker, regex and LLM in Code/HTTP nodes.
 
 ## Open items to verify
 - Customer and agent channel order in the dual-channel mp3.
 - Sample rate and bitrate. Probe with `ffprobe` on a freshly re-signed link during the pilot.
 - How long Telnyx keeps recordings (older calls may already be gone).
-- Legal position on reusing recordings, and the state list.
+- The caller recording-disclosure wording (does it cover training use?) and the agent release text.
+
+## 7. Notes for the service builder
+
+- **Dual channel:**
+  - TR records `mp3`, `channels:'dual'` (Telnyx `record_start`). Each leg is on its own channel.
+  - Which channel is the customer is **not yet verified**. Telnyx maps channels by call leg; check their `record_start` docs.
+  - Run `ffprobe -show_streams` on a few freshly signed pilot files, listen to the first 10 s of each channel, and record the result as `channel_map` in the submit payload. Don't infer it at runtime.
+  - Transcribe each channel separately; this gives speaker labels for free.
+- **Idempotency:**
+  - `POST /jobs` with an existing `idempotency_key` returns the existing job (same `job_id`); the job never runs twice.
+  - Callbacks are at-least-once. Every callback carries `job_id`, `status` and `attempt`. TR dedupes on `(job_id, status)` and returns 2xx for duplicates.
+- **Length and timeouts:**
+  - Plan for **60 min max** (49-min calls exist), about 60 MB mp3. Reject anything over 90 min with `bad_audio:too_long`.
+  - Everything is async: speech-to-text through the vendor's async API with a webhook or polling, never a synchronous HTTP call.
+  - Per-job wall clock is 2 h. Stream the download to disk, not memory.
+- **Models:**
+  - **Speech-to-text needs word-level timestamps.** Use a dedicated STT API (AssemblyAI, Deepgram, AWS). General LLM audio models via OpenRouter do not give reliable word timestamps, so don't use them for bleep placement.
+  - OpenRouter LLMs are for **text tasks only**: labeling clips, coaching, and the second-opinion PII check.
+  - **Pin versions:** the STT model/tier and the exact OpenRouter model slug (no `:latest` or auto-routing), and a provider allowlist with zero data retention.
+  - Record every model used in `engine` on each job.
+- **Cost caps:**
+  - Per job: estimate before running (minutes × rate plus tokens) and abort with `failed:cost_cap` over **$2**.
+  - Monthly: stop accepting jobs over **$100** (configurable) and alert.
+  - Report `metrics.cost_usd` per job.
+- **Deterministic labels:**
+  - Fixed clip taxonomy (§2.6) and rubric `fe_v1`, temperature 0, fixed seed if the model supports it.
+  - Validate the output against a JSON Schema. On failure, retry once with the validation error included; if it still fails, return `qa_flag` + `labels_invalid`. Never return free-form labels.
+- **Schema versioning:**
+  - Every output carries `schema_version` (start at `1.0`). Adding fields is a minor version; renaming or removing is a major version, announced and kept running side by side for 30 days.
+  - TR stores `schema_version` on each job.
+- **Test fixtures:**
+  - 10–15 **synthetic** two-channel calls (TTS or staff role-play) with PII planted at known timestamps: names, phone, address, DOB, SSN, card, MBI, digits spelled out and read back, crosstalk, and a 45–50 min long call.
+  - Optionally a few real calls with consent.
+  - CI target: 100% of planted PII bleeped (with padding), 0 PII in the second pass, clip labels stable across 3 reruns.
+  - Never use real customer calls as fixtures.
+- **Retries:**
+  - Fetch: 3× with backoff 30 s / 2 m / 10 m. If the signed URL expired, return `fetch_expired` so TR re-signs; don't retry.
+  - STT and LLM: 3× with exponential backoff and jitter.
+  - Callback: 5× over about 2 h.
+- **Logging:** log job_id, call_id, status, timings, counts and cost only. **Never** transcripts, PII text, signed URLs or secrets. Redact URLs to the host.
+- **Secrets:**
+  - Separate HMAC secrets for each direction. Rotate every 90 days or on suspected exposure, with a 24 h overlap where both old and new are accepted (`v1=` signature header supports several keys).
+  - Vendor keys stay in n8n credentials only.
+- **Deletion:**
+  - `DELETE /jobs/:id` (HMAC) removes every service-side copy (source, artifacts, transcripts, logs that reference the job) and confirms by callback `status:"deleted"`.
+  - The automatic ≤7-day cleanup still applies.

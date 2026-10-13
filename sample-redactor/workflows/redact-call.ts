@@ -1,6 +1,7 @@
 // The redaction pipeline as one durable run per job.
 //   claim → fetch → ASR pass 1 (multichannel) → detect → render → transcript files
-//   → labels/coaching/highlight → ASR pass 2 on the redacted audio → verify → complete
+//   → smart clips + coaching (SPEC v0.2) → ASR pass 2 on the redacted audio
+//   → verify (full audio, every clip, all coaching text) → complete
 // Exactly once: the bridge's claim lets one run own a job; a duplicate start
 // returns at once. Any failure ends the job with an error code and purges
 // AssemblyAI's copies; TR's bridge purges scratch + partial artifacts.
@@ -9,7 +10,7 @@ import { start } from "workflow/api";
 import { LIMITS, MODELS, PIPELINE_VERSION } from "@/lib/config";
 import { codeFromError, jobError } from "@/lib/errors";
 import {
-  asrStatus, claimJob, completeJob, detectPii, failJob, fetchSource, labelAndHighlight, purgeAsr, purgeJobs, renderAudio, savePass1,
+  asrStatus, claimJob, clipsAndCoaching, completeJob, detectPii, failJob, fetchSource, purgeAsr, purgeJobs, renderAudio, savePass1,
   setStatus, submitAsr, verifySecondPass, writeTranscriptArtifacts, type Ctx,
 } from "./steps";
 
@@ -36,13 +37,13 @@ async function transcribe(ctx: Ctx, pass: "pass1" | "pass2", durationMs: number,
   throw jobError("timeout", `${pass} not transcribed within ${LIMITS.asrWaitMinutes} min`);
 }
 
-export async function redactCall(jobId: string) {
+export async function redactCall(jobId: string, idempotencyKey: string) {
   "use workflow";
   const runId = getWorkflowMetadata().workflowRunId;
   const asrIds: string[] = [];
 
   try {
-    const claim = await claimJob(jobId, runId);
+    const claim = await claimJob(jobId, runId, idempotencyKey);
     if (claim.duplicate) return { status: "duplicate" as const };
     const ctx = claim.ctx;
 
@@ -55,7 +56,7 @@ export async function redactCall(jobId: string) {
     const det = await detectPii(ctx, src, pass1);
     const audio = await renderAudio(ctx, src);
     const files = await writeTranscriptArtifacts(ctx, src);
-    const lab = await labelAndHighlight(ctx, src);
+    const lab = await clipsAndCoaching(ctx, src);
 
     const engine = {
       asr: `assemblyai:${MODELS.asr}`,
@@ -68,13 +69,12 @@ export async function redactCall(jobId: string) {
     const id2 = await transcribe(ctx, "pass2", src.durationMs, asrIds);
     const second = await verifySecondPass(ctx, id2);
 
-    const qaReasons = [...det.reasons, ...second, ...(lab.highlightReason ? [lab.highlightReason] : [])];
+    const qaReasons = [...det.reasons, ...lab.reasons, ...second];
     await completeJob(ctx, {
       artifacts: {
         redacted_audio: { name: "redacted.mp3", sha256: audio.sha256, bytes: audio.bytes },
-        highlight_audio: lab.highlight_audio,
         ...files,
-        labels_json: lab.labels_json,
+        clips_json: lab.clips_json,
         coaching_json: lab.coaching_json,
       },
       qaReasons,
@@ -89,6 +89,8 @@ export async function redactCall(jobId: string) {
         duration_ms: src.durationMs,
         source: { channels: src.channels, sample_rate: src.sampleRate, bitrate_kbps: src.bitrateKbps },
         llm_calls: det.llmCalls + 1,
+        clips: lab.clipCount,
+        clips_exported: lab.exportedCount,
       },
       engine,
     });

@@ -3,6 +3,10 @@
 // first), delete AssemblyAI's transcripts, and schedule a re-purge of TR storage
 // for after every signed upload URL has expired. TR purges its storage itself now.
 // Auth: X-TR-Signature with SAMPLE_REDACTOR_START_SECRET. Body: {job_ids[], run_ids[], transcript_ids[]}.
+// Replay inside the ±300 s window is harmless by construction, so there is no nonce store: every effect is
+// idempotent (cancelling a stopped run, deleting a deleted transcript, one more delayed purge of tombstoned or
+// finished jobs; the bridge's purge never touches a live job). 207 = something could not be removed yet;
+// TR then keeps the job undeleted and offers the action again.
 import { getRun, start } from "workflow/api";
 import { purgeLater } from "@/workflows/redact-call";
 import { deleteTranscript } from "@/lib/assemblyai";

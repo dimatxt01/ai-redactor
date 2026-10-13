@@ -1,0 +1,14 @@
+# Medicare ID read with spoken dashes and read back, plus a policy number. Fictional MBI (passes the CMS format, belongs to nobody).
+# meta: agent=Tessa Moreland; caller=Clifford Ashby
+A: Good afternoon, this is [[NAME:Tessa]], am I speaking with [[NAME:Clifford Ashby]]?
+C: You are.
+A: Thanks [[NAME:Clifford]]. Do you have your red, white and blue Medicare card handy?
+C: Hang on, let me grab my wallet. Okay, here it is.
+A: Go ahead and read me the number on the front, nice and slow.
+C: [[MBI:seven K D nine dash H A two dash W N five six]].
+A: Let me read it back. [[MBI:Seven, K, D, nine, dash, H, A, two, dash, W, N, five, six]]?
+C: That's it exactly.
+A: And you mentioned an older policy you want to replace. What's the policy number on that letter?
+C: It says [[POLICY:P L nine four four two one eight]].
+A: Got it, [[POLICY:P L nine four four, two one eight]]. We'll take care of the replacement paperwork.
+C: Thank you, that's a relief.

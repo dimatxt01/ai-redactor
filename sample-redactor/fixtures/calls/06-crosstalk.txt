@@ -1,0 +1,13 @@
+# Crosstalk: the agent talks over the customer while the phone number and date of birth are said. Fictional values.
+# meta: agent=Rafael Ortiz; caller=Bernice Haldane
+A: This is [[NAME:Rafael]], thanks for holding [[NAME:Bernice]].
+C: No problem at all.
+A: What's a good callback number for you?
+C: It's [[PHONE:five five five, two one nine, oh four four seven]], that's my cell.
+A: >>-1800 Uh huh, okay, I'm writing that down.
+C: >>-900 And the house phone is the same area code.
+A: Perfect. And your date of birth?
+C: [[DOB:August twelfth nineteen forty four]].
+A: >>-1500 Got it, sorry, go ahead.
+C: >>-700 [[DOB:August twelfth, forty four]], I said.
+A: Thank you, that matches what I have.

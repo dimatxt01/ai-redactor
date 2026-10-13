@@ -1,0 +1,59 @@
+# Long call (45–50 min): three kinds of everyday talk repeated with varied wording, planted values at the start, middle and past minute 40. Fictional values.
+# strict
+# meta: agent=Nadine Corwell; caller=Herbert Vasquez
+A: Thanks for holding, this is [[NAME:Nadine]], am I speaking with [[NAME:Herbert Vasquez]]?
+C: Yes ma'am, that's me.
+A: Wonderful. Before we start, can you confirm your date of birth for me?
+C: [[DOB:October fourth nineteen forty nine]].
+A: Thank you. This call can take a while, so get comfortable, grab some coffee, and stop me any time.
+# repeat 27
+A: {Now|Alright|Okay}, {let's|I'd like to} {go through|walk through|talk about} the health questions, {and there are no wrong answers|so just answer as best you can|and take your time with them}.
+C: {Sure|Okay|That's fine}, {go ahead|I'm ready|fire away}, {I've got time|I'm not going anywhere|the afternoon is free}.
+A: {In the last few years|Recently|Over the past while}, have you {been in the hospital overnight|stayed in a hospital|had any surgery}?
+C: {No, nothing like that|Not that I can remember|Thankfully no}, {I've been lucky|knock on wood|the doctor says I'm doing well}.
+A: {That's good to hear|Glad to hear it|Good}. {And do you use any oxygen at home|Do you need help with bathing or dressing|Do you use a wheelchair or walker}?
+C: {No, I get around fine on my own|Not at all|No, I still mow my own lawn}, {believe it or not|most days anyway|even with my knees}.
+A: {Perfect|Great|Okay}, {that helps a lot|that keeps things simple|that's what I like to hear}. {Any trouble with your memory|Any recent changes in your health|Anything your doctor is watching closely}?
+C: {Just the usual aches|Nothing serious|Only my blood pressure, and that's under control}, {like anybody my age|I'd say|as far as I know}.
+A: {Understood|I see|Got it}, {I'll make a note of that|that's very common|that won't be a problem for this plan}.
+C: {Good|Okay then|That's a relief}, {I was worried about that part|I always get nervous with these questions|my neighbor said it was easy}.
+# end
+A: Before I forget, what's the best number to reach you if we get disconnected?
+C: [[PHONE:five five five, four eight one, oh three six two]].
+A: Thank you, I have that. Let's keep going.
+# repeat 27
+A: {So|Now|Okay}, {here's how the plan works|let me explain the coverage|I'll walk you through the benefits}, {in plain words|without the fine print|nice and simple}.
+C: {Please do|Okay|I'm listening}, {I never understood these things|my late wife handled all this|that would help}.
+A: {The coverage starts right away|There's no waiting period on this plan|You're covered from the day it's approved}, {for any natural cause|for accidents and illness alike|with no medical exam}.
+C: {Really|Is that right|Huh}, {I thought there was always a waiting period|that's better than I expected|my old plan wasn't like that}.
+A: {And the price is locked|Your premium never goes up|The rate stays the same for life}, {even as you get older|no matter what happens with your health|and it can't be canceled on you}.
+C: {That's important to me|I like the sound of that|That's what I was hoping}, {on a fixed income|since I'm retired|with prices going up everywhere}.
+A: {The money goes straight to your family|Your loved ones get the benefit quickly|The payout comes fast}, {usually within days|without a long wait|so they can handle the funeral}.
+C: {That's really the whole point|That's what matters|Good}, {I don't want them stuck with the bill|they've got enough on their plate|I want it to be easy on them}.
+A: {Exactly|Absolutely|Right}, {that's why most folks call us|that's what this plan is for|you're thinking about it the right way}.
+C: {Okay|Alright|Fair enough}, {keep going|what else should I know|that makes sense so far}.
+# end
+A: Let me get the mailing address for the policy packet.
+C: [[ADDRESS:three twenty seven Willowbrook Drive]].
+A: And the zip code there?
+C: [[ADDRESS:eight five two one nine]].
+A: Thank you, that's where the packet will go.
+# repeat 27
+C: {You know|Funny thing|I'll tell you}, {my grandson helped me find your website|my daughter keeps telling me to get this done|my buddy from church has a plan like this}.
+A: {Oh that's sweet|That's wonderful|Good for them}, {it sounds like they look out for you|family is everything|you've got good people around you}.
+C: {They do|They sure do|Most of the time}, {they come by on Sundays for dinner|they call me every evening|they keep me on my toes}.
+A: {That's lovely|I love hearing that|How nice}. {Do you still cook for everybody|Do you have a favorite dish you make|Who does the cooking these days}?
+C: {I make a mean pot roast|I still do the grilling|My chili is famous on the block}, {if I say so myself|according to the kids|that's what they tell me}.
+A: {Now you're making me hungry|I might need that recipe|That sounds delicious}, {honestly|no kidding|I have to say}.
+C: {Ha|Well|Oh boy}, {I'll have to send it to you|it's an old family secret|it's nothing fancy really}.
+A: {I appreciate that|Maybe someday|That's very kind}, {let's get back to the paperwork|we're almost through this part|thanks for sharing that with me}.
+C: {Sure thing|Right|Okay}, {sorry for rambling|I do go on sometimes|I get to talking}.
+A: {Not at all|Don't apologize|It's my favorite part of the job}, {I enjoy it|that's what makes this fun|take all the time you need}.
+# end
+A: Almost done. For the application I need your social security number.
+C: [[SSN:nine one eight, four four, seven two six three]].
+A: And for the monthly draft, the card number?
+C: [[CARD:four one one one, one one one one, one one one one, one one one one]].
+A: Thank you [[NAME:Herbert]]. Your policy number will be [[POLICY:F E seven seven two oh nine one]].
+C: Let me write that down. Thank you [[NAME:Nadine]], you've been very patient.
+A: It was my pleasure. Have a wonderful evening.

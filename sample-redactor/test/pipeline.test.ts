@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { bleepPcm } from "@/lib/audio";
 import { redactedLines, spansJson } from "@/lib/artifacts";
-import { snapHighlight } from "@/lib/labels";
+import { buildClips, snapClip, validateAnswer, type RedactedLine } from "@/lib/labels";
 import { safeValue } from "@/lib/log";
 import { bleepIntervals, ruleSpans } from "@/lib/pii/detect";
-import { secondPassReasons } from "@/lib/qa";
+import { clipReasons, secondPassReasons, textPiiReasons } from "@/lib/qa";
 import { signBody, verifySignature } from "@/lib/signature";
 import { codeFromError, jobError } from "@/lib/errors";
 import { fromAssemblyAi } from "@/lib/words";
@@ -26,15 +26,83 @@ describe("bleep DSP", () => {
   });
 });
 
-describe("highlight", () => {
-  it("clamps to 3–8 min and never starts or ends inside a bleep", () => {
-    const bleeps = [{ start_ms: 59_000, end_ms: 61_000 }, { start_ms: 299_000, end_ms: 301_000 }];
-    const h = snapHighlight({ start_ms: 60_000, end_ms: 300_000 }, bleeps, 1_800_000)!;
-    expect(h.start_ms).toBeGreaterThanOrEqual(61_000);
-    expect(h.end_ms).toBeLessThanOrEqual(299_000);
-    const long = snapHighlight({ start_ms: 0, end_ms: 900_000 }, [], 1_800_000)!;
-    expect(long.end_ms - long.start_ms).toBe(480_000);
-    expect(snapHighlight({ start_ms: 0, end_ms: 60_000 }, [], 60_000)).toBeNull();   // call too short
+// one utterance every 10 s, 9 s long
+const L = (n: number): RedactedLine[] =>
+  Array.from({ length: n }, (_, u) => ({ u, speaker: u % 2 ? "customer" : "agent", start_ms: u * 10_000, end_ms: u * 10_000 + 9_000, text: `line ${u}` }));
+const scores = { rapport: 4, discovery: 3, objections: null, close: null, compliance: 5 };
+const answer = (clips: object[], extra: object = {}) => ({
+  clips: clips.map((c) => ({ label: "opener", sub_label: "none", from_u: 0, to_u: 3, title: "t", did: "d", worked: "w", improve: "i",
+    key_line_ids: [1], scores, confidence: 0.9, ...c })),
+  call: { summary: "s", strengths: ["a", "b", "c"], improvements: ["x", "y", "z"], scores: { ...scores, objections: 3, close: 4 }, turning_point_clip: 0, ...extra },
+});
+
+describe("smart clips (SPEC v0.2 §2.6)", () => {
+  it("snaps to utterance boundaries inside 20–240 s", () => {
+    const lines = L(60);
+    expect(snapClip(2, 5, lines, [], 600_000)).toEqual({ start_ms: 20_000, end_ms: 59_000 });
+    // too long (0..40 = 409 s) trims whole utterances from the end
+    const long = snapClip(0, 40, lines, [], 600_000)!;
+    expect(long.end_ms - long.start_ms).toBeLessThanOrEqual(240_000);
+    expect(lines.some((l) => l.end_ms === long.end_ms)).toBe(true);
+    // too short (one 9 s line) grows to the next lines
+    const short = snapClip(7, 7, lines, [], 600_000)!;
+    expect(short.end_ms - short.start_ms).toBeGreaterThanOrEqual(20_000);
+    expect(short.start_ms).toBe(70_000);
+  });
+  it("never starts or ends inside a bleep", () => {
+    const lines = L(60);
+    const bleeps = [{ start_ms: 19_500, end_ms: 21_000 }, { start_ms: 58_000, end_ms: 60_500 }];
+    const c = snapClip(2, 5, lines, bleeps, 600_000)!;
+    const inside = (t: number) => bleeps.some((b) => t > b.start_ms && t < b.end_ms);
+    expect(inside(c.start_ms) || inside(c.end_ms)).toBe(false);
+    expect(c.start_ms).toBe(30_000);   // moved to the next utterance start
+    // u5's end is bleeped: back to u4 (49 s), too short (19 s), so it grows past the bleeped u5 end to u6
+    expect(c.end_ms).toBe(69_000);
+  });
+  it("returns null when no window fits", () => {
+    expect(snapClip(0, 1, L(2), [], 19_000)).toBeNull();
+  });
+  it("validates the answer: taxonomy-only rules, counts, ids, scores", () => {
+    const lines = L(30);
+    expect(validateAnswer(answer([{}]) as never, lines, 6)).toEqual([]);
+    expect(validateAnswer(answer(Array(7).fill({})) as never, lines, 6)).toContain("clips: at most 6");
+    expect(validateAnswer(answer([{ to_u: 99 }]) as never, lines, 6).join()).toMatch(/ids that appear/);
+    expect(validateAnswer(answer([{ label: "objection" }]) as never, lines, 6).join()).toMatch(/sub_label/);
+    expect(validateAnswer(answer([{ sub_label: "price" }]) as never, lines, 6).join()).toMatch(/sub_label/);
+    expect(validateAnswer(answer([{ scores: { ...scores, rapport: 7 } }]) as never, lines, 6).join()).toMatch(/rapport/);
+    expect(validateAnswer(answer([{}], { strengths: ["a"] }) as never, lines, 6).join()).toMatch(/exactly 3/);
+    expect(validateAnswer(answer([{}], { turning_point_clip: 3 }) as never, lines, 6).join()).toMatch(/turning_point/);
+  });
+  it("orders clips c1..cN by time, keeps application audio out, quotes only redacted lines", () => {
+    const lines = L(60).map((l) => (l.u === 41 ? { ...l, text: "my date of birth is [REDACTED:DOB]" } : l));
+    const a = answer([
+      { label: "application", from_u: 40, to_u: 45, key_line_ids: [41] },
+      { label: "objection", sub_label: "price", from_u: 10, to_u: 14 },
+    ], { turning_point_clip: 1 });
+    const { clips, coaching } = buildClips(a as never, lines, [], 600_000, "m");
+    expect(clips.map((c) => [c.clip_id, c.label, c.audio_exported])).toEqual([["c1", "objection", true], ["c2", "application", false]]);
+    expect(clips[1].coaching.key_lines).toEqual(["my date of birth is [REDACTED:DOB]"]);
+    expect(coaching.turning_point_clip_id).toBe("c1");
+    expect(coaching.rubric).toBe("fe_v1");
+  });
+});
+
+describe("second pass on clips and coaching text (SPEC v0.2 §2.8)", () => {
+  it("maps full-audio hits into the clips that contain them", () => {
+    const clips = [
+      { clip_id: "c1", start_ms: 0, end_ms: 60_000, audio_exported: true },
+      { clip_id: "c2", start_ms: 50_000, end_ms: 90_000, audio_exported: false },
+    ];
+    expect(clipReasons(["second_pass_digit_run@55000ms", "second_pass_name@95000ms"], clips)).toEqual(["second_pass_clip:c1:second_pass_digit_run@55000ms"]);
+  });
+  it("flags digits, MBIs and names in generated text, not ordinary coaching", () => {
+    const r = textPiiReasons([
+      { where: "call.summary", text: "The agent built rapport and closed on the $45.50 a month plan." },
+      { where: "c1.did", text: "Read back 5 5 5 0 1 9 8 to confirm." },
+      { where: "c2.did", text: "Thanked Harold for his time." },
+      { where: "c3.did", text: "Noted 1EG4-TE5-MK73 for the file." },
+    ], ["harold"]);
+    expect(r).toEqual(["coaching_pii:c1.did:digit_run", "coaching_pii:c2.did:name", "coaching_pii:c3.did:digit_run", "coaching_pii:c3.did:mbi"]);
   });
 });
 

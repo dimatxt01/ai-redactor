@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import ffmpegStatic from "ffmpeg-static";
-import { BLEEP, HIGHLIGHT, PITCH_SEMITONES } from "./config";
+import { BLEEP, CLIPS, PITCH_SEMITONES } from "./config";
 import type { Interval } from "./pii/detect";
 
 export const WORK_SR = 16_000;   // processing rate; telephony source is ≤16 kHz
@@ -174,15 +174,15 @@ export async function encodeMp3(pcmFile: string, outMp3: string, versionTag: str
   );
 }
 
-/** Cut [start,end] from the already-redacted mp3 with 1 s fades. */
-export async function cutHighlight(srcMp3: string, outMp3: string, iv: Interval, versionTag: string): Promise<void> {
+/** Cut a clip [start,end] from the already-redacted mp3 with 1 s fades (SPEC v0.2 §2.6). */
+export async function cutClip(srcMp3: string, outMp3: string, iv: Interval, versionTag: string): Promise<void> {
   const ss = iv.start_ms / 1000;
   const dur = (iv.end_ms - iv.start_ms) / 1000;
-  const f = HIGHLIGHT.fadeS;
+  const f = CLIPS.fadeS;
   await must(
     ["-ss", ss.toFixed(3), "-t", dur.toFixed(3), "-i", srcMp3,
       "-af", `afade=t=in:st=0:d=${f},afade=t=out:st=${Math.max(0, dur - f).toFixed(3)}:d=${f}`,
       "-ar", "44100", "-ac", "1", "-b:a", "128k", "-id3v2_version", "3", "-metadata", `comment=${versionTag}`, outMp3],
-    "highlight",
+    "clip",
   );
 }

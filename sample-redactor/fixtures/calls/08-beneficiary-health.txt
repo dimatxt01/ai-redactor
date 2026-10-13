@@ -1,0 +1,14 @@
+# Beneficiaries, conditions and medications (model-only kinds), address with apartment and ZIP. Fictional values.
+# meta: agent=Gordon Lessard; caller=Imogene Truitt
+A: [[NAME:Imogene]], I have a few health questions. Have you been treated for any heart trouble?
+C: I had [[HEALTH:congestive heart failure]] a while back, and they say I have [[HEALTH:COPD]] now.
+A: Thank you for telling me. Any medications for those?
+C: I take [[MEDICATION:furosemide]] and [[MEDICATION:lisinopril]], and an inhaler, [[MEDICATION:albuterol]].
+A: Got it. And who would you like to name as your beneficiaries?
+C: My son [[BENEFICIARY:Desmond Truitt]] and my niece [[BENEFICIARY:Carla Mendenhall]].
+A: Split evenly between them?
+C: Yes, half and half.
+A: And where should we mail the policy?
+C: [[ADDRESS:eight oh nine Larkspur Lane]], [[ADDRESS:apartment twelve]], [[CITY:Bowling Green]], [[ADDRESS:four two one oh four]].
+A: Let me repeat that. [[ADDRESS:Eight oh nine Larkspur Lane]], [[ADDRESS:apartment twelve]], zip [[ADDRESS:four two one oh four]].
+C: That's right.

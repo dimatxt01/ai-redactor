@@ -7,6 +7,7 @@
 #   cd sample-redactor && npm run validate              # everything; vendors if keys are set
 #   npm run validate -- --offline                       # never call the vendors
 #   npm run validate -- --fresh                         # clean npm ci for worker + frontend first
+#   npm run validate -- --skip-long                     # vendor eval without the 47-min call (~$1 of the ~$1.6)
 #
 # Keys: export ASSEMBLYAI_API_KEY / OPENROUTER_API_KEY, or put them in
 # sample-redactor/.env.local (gitignored). They are never printed or written out.
@@ -21,11 +22,12 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 REPORT="$OUT/validation-$STAMP.md"
 LOGDIR="$OUT/validation-$STAMP.logs"
 mkdir -p "$LOGDIR"
-OFFLINE=0; FRESH=0
+OFFLINE=0; FRESH=0; SKIP_LONG=0
 for a in "$@"; do
   case "$a" in
     --offline) OFFLINE=1 ;;
     --fresh) FRESH=1 ;;
+    --skip-long) SKIP_LONG=1 ;;
     *) echo "unknown option: $a"; exit 2 ;;
   esac
 done
@@ -79,7 +81,8 @@ if [ $FRESH = 1 ] || [ ! -d node_modules ]; then
 else
   skip "worker: npm ci" "node_modules present (use --fresh to reinstall)"
 fi
-step "worker: typecheck" "tsc clean" npx tsc --noEmit
+# not incremental: two incremental runs on one tsbuildinfo can block each other
+step "worker: typecheck" "tsc clean" node node_modules/.bin/tsc --noEmit --incremental false
 step "worker: unit tests (detectors, DSP, HMAC, logs)" "all passed" npx vitest run
 step "worker: production build (next + workflow)" "build ok" npx next build
 
@@ -88,7 +91,7 @@ RB="$("$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q rubberband && echo y
 
 # ── 3. synthetic test calls ───────────────────────────────────────────────────
 if command -v say >/dev/null; then
-  step "test calls: generate (macOS say, 2 voices)" "4 dual-channel mp3s" npm run make-test-calls
+  step "test calls: generate (macOS say, 2 voices)" "12 dual-channel mp3s (incl. crosstalk, 47-min call)" npm run make-test-calls
 elif ls "$OUT"/0*-*.mp3 >/dev/null 2>&1; then
   skip "test calls: generate" "no macOS say; using the mp3s already in fixtures/out"
 else
@@ -96,7 +99,7 @@ else
 fi
 callfmt() {
   local bad=0 f info
-  for f in "$OUT"/0[1-4]-*.mp3; do
+  for f in "$OUT"/[0-9][0-9]-*.mp3; do
     case "$f" in *.redacted.mp3) continue ;; esac
     info="$("$FFMPEG" -hide_banner -i "$f" 2>&1 | grep 'Audio:')"
     echo "$(basename "$f"): $info"
@@ -131,6 +134,8 @@ smoke() {
   expect "jobs, 10 min old"          /api/jobs   "$body" "$(sign "$secret" "$body" 600)"      401
   expect "jobs, body changed"        /api/jobs   "$body" "$(sign "$secret" '{"job_id":"x"}')" 401
   expect "jobs, signed, bad job id"  /api/jobs   "$body" "$(sign "$secret" "$body")"          400
+  local nokey='{"job_id":"00000000-0000-4000-8000-000000000000","idempotency_key":"nope"}'
+  expect "jobs, signed, bad key"     /api/jobs   "$nokey" "$(sign "$secret" "$nokey")"        400
   expect "delete, unsigned"          /api/delete '{"job_ids":[]}' ""                          401
   expect "delete, wrong secret"      /api/delete '{"job_ids":[]}' "$(sign wrong '{"job_ids":[]}')" 401
   if grep -qF "$secret" "$LOGDIR/next-start.log"; then echo "the secret reached the server log"; fails=1; fi
@@ -141,15 +146,16 @@ step "worker: local server, HMAC fails closed" "health ok; unsigned/wrong/stale/
 
 # ── 5. TR edge functions ──────────────────────────────────────────────────────
 cd "$ROOT/supabase/functions"
-step "edge functions: deno check" "bridge, admin, shared helpers typecheck" \
-  "${DENO[@]}" check sample-redaction-bridge/index.ts sample-library-admin/index.ts _shared/sampleSignature.ts _shared/telnyxRecording.ts
+step "edge functions: deno check" "bridge, training-library-admin, ops-alert, shared helpers typecheck" \
+  "${DENO[@]}" check sample-redaction-bridge/index.ts training-library-admin/index.ts ops-alert/index.ts _shared/sampleSignature.ts _shared/telnyxRecording.ts
 cd "$ROOT"
 step "HMAC parity: Deno (TR) ↔ Node (worker)" "same header; same refusals" "${DENO[@]}" run supabase/tests/sample_signature_parity.ts
 
 # ── 6. migration on a throwaway Postgres ──────────────────────────────────────
 if command -v initdb >/dev/null || ls /opt/homebrew/opt/postgresql@1[5-9]/bin/initdb /usr/lib/postgresql/1[5-9]/bin/initdb >/dev/null 2>&1; then
-  step "migration: throwaway Postgres (gate, cap race, RLS, rollback)" "all invariants hold; rollback clean" \
-    bash supabase/tests/run_sample_library_tests.sh
+  step "migration: throwaway Postgres on RL-1 (caps, race, guards, ingest, takedown, rollback)" "all cases pass; RL-1 cases still pass on top" \
+    bash supabase/tests/sample_redaction/run.sh
+  step "RL-1 migration tests (unchanged, as on main)" "RL-1 cases pass" bash supabase/tests/training_library/run.sh
 else
   skip "migration: throwaway Postgres" "no local PostgreSQL 15+ (brew install postgresql@17)"
 fi
@@ -158,15 +164,18 @@ fi
 wiring() {
   node -e '
     const fs=require("fs"); const m=JSON.parse(fs.readFileSync("supabase/functions/integrity-audit/manifest.json","utf8"));
-    const want=[["sample_library_approvals","sample_library_approvals_append_only"],["sample_library","sample_library_status_gate"]];
+    const want=[["sample_redaction_jobs","sample_redaction_jobs_service_columns"],["training_library_calls","sample_redaction_takedown_guard"]];
     const t=JSON.stringify(m); for (const [tb,tr] of want) if(!t.includes(`"table":"${tb}","trigger":"${tr}"`)) { console.log("manifest missing", tb, tr); process.exit(1); }
-    console.log("manifest", m.version ?? "", "has both sample_* triggers");'
-  for f in sample-library-admin sample-redaction-bridge; do
+    if (m.manifest_version !== "2026-10-12.3") { console.log("manifest_version", m.manifest_version, "(want 2026-10-12.3: main 2026-10-12.2 + this change)"); process.exit(1); }
+    console.log("manifest", m.manifest_version, "has both new triggers");'
+  for f in training-library-admin sample-redaction-bridge; do
     awk -v f="[functions.$f]" '$0==f{getline; if ($0 ~ /verify_jwt = false/) ok=1} END{exit !ok}' supabase/config.toml \
       && echo "config.toml: $f verify_jwt=false" || { echo "config.toml: $f entry missing"; return 1; }
   done
-  [ -f scripts/rollbacks/rollback_20261012230000_sample_library.sql ] || { echo "rollback missing"; return 1; }
-  if grep -qiE 'update +(public\.)?feature_flags|insert +into +(public\.)?feature_flags' supabase/migrations/20261012230000_sample_library.sql; then
+  [ -f scripts/rollbacks/rollback_20261013050000_sample_redaction_worker.sql ] || { echo "rollback missing"; return 1; }
+  local dup; dup="$(ls supabase/migrations | sed -n 's/^\([0-9]\{14\}\)_.*/\1/p' | sort | uniq -d)"
+  [ -z "$dup" ] && echo "no duplicate migration versions" || { echo "duplicate migration versions: $dup"; return 1; }
+  if grep -qiE 'update +(public\.)?feature_flags|insert +into +(public\.)?feature_flags' supabase/migrations/20261013050000_sample_redaction_worker.sql; then
     echo "migration writes feature_flags"; return 1; fi
   echo "rollback present; migration flips no flags"
 }
@@ -188,14 +197,14 @@ hygiene() {
 }
 step "repo: no secrets, no audio, no env files" "nothing sensitive in the branch" hygiene
 
-# ── 8. frontend (the /admin/sample-library page) ──────────────────────────────
+# ── 8. frontend (/am/recording-library + /admin/recording-library) ────────────
 cd "$ROOT"
 if [ $FRESH = 1 ] || [ ! -d node_modules ]; then
   step "frontend: npm ci" "deps installed" npm ci --no-audit --no-fund
 else
   skip "frontend: npm ci" "node_modules present (use --fresh to reinstall)"
 fi
-OURS='src/pages/admin/SampleLibrary.tsx|src/components/admin/sample-library/|src/App.tsx|src/components/AdminLayout.tsx'
+OURS='src/pages/admin/RecordingLibrary.tsx|src/components/recording-library/|src/lib/recordingLibraryFlag.ts|src/App.tsx|src/components/AdminLayout.tsx|src/components/AMLayout.tsx'
 fe_tsc() {
   npx tsc -p tsconfig.app.json --noEmit > "$LOGDIR/tsc-app.txt" 2>&1
   local total ours
@@ -207,10 +216,10 @@ fe_tsc() {
 }
 step "frontend: typecheck (this branch adds no errors)" "0 new errors (baseline 5 untouched)" fe_tsc
 step "frontend: eslint on the new page + components" "lint clean" \
-  npx eslint src/pages/admin/SampleLibrary.tsx src/components/admin/sample-library
+  npx eslint src/pages/admin/RecordingLibrary.tsx src/components/recording-library src/lib/recordingLibraryFlag.ts
 fe_lint_changed() {  # repo lint is not clean on main (≈700 errors): edited files must not get worse
   local f now was bad=0
-  for f in src/App.tsx src/components/AdminLayout.tsx; do
+  for f in src/App.tsx src/components/AdminLayout.tsx src/components/AMLayout.tsx; do
     now="$(npx eslint -f json "$f" | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].errorCount')"
     was="$(git show "origin/main:$f" | npx eslint -f json --stdin --stdin-filename "$f" | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))[0].errorCount')"
     echo "$f: $now errors (main: $was)"
@@ -218,7 +227,7 @@ fe_lint_changed() {  # repo lint is not clean on main (≈700 errors): edited fi
   done
   return $bad
 }
-step "frontend: eslint on edited files (no new errors vs main)" "App.tsx, AdminLayout.tsx no worse than main" fe_lint_changed
+step "frontend: eslint on edited files (no new errors vs main)" "App.tsx, AdminLayout.tsx, AMLayout.tsx no worse than main" fe_lint_changed
 step "sample-redactor: eslint with the repo rules" "lint clean (repo-wide npm run lint gains nothing)" \
   npx eslint sample-redactor --ignore-pattern '**/.next/**' --ignore-pattern '**/.well-known/**' --ignore-pattern 'sample-redactor/node_modules/**'
 step "frontend: vite production build" "build ok" npm run build
@@ -231,8 +240,9 @@ if [ $OFFLINE = 1 ]; then
 elif [ -z "${ASSEMBLYAI_API_KEY:-}" ]; then
   skip "vendors: real-audio leak eval" "ASSEMBLYAI_API_KEY not set (env or sample-redactor/.env.local)"
 else
-  [ -z "${OPENROUTER_API_KEY:-}" ] && VENDOR_NOTE=" (OPENROUTER_API_KEY not set: model PII pass + labels skipped)"
-  step "vendors: real-audio leak eval$VENDOR_NOTE" "no planted value audible or in transcripts; labels valid" npm run eval
+  [ -z "${OPENROUTER_API_KEY:-}" ] && VENDOR_NOTE=" (OPENROUTER_API_KEY not set: model PII pass, clips + coaching skipped)"
+  EVAL_ARGS=(); [ $SKIP_LONG = 1 ] && EVAL_ARGS+=(--skip-long)
+  step "vendors: real-audio leak eval$VENDOR_NOTE" "no planted value audible or in transcripts; clips valid + stable x3; no PII in coaching" npm run eval -- "${EVAL_ARGS[@]}"
 fi
 
 # ── report ────────────────────────────────────────────────────────────────────
@@ -253,16 +263,18 @@ fi
     echo
     node -e '
       const r=require(process.argv[1]); console.log(r.summary+"\n");
-      console.log("| call | words | bleeped | leaks | transcript leaks | second pass | labels | llm $ | pitch |");
-      console.log("|---|---|---|---|---|---|---|---|---|");
+      console.log("| call | min | bleeped | leaks | transcript leaks | second pass | clips (labels) | stable x runs | coaching PII | over-bleeped | llm $ |");
+      console.log("|---|---|---|---|---|---|---|---|---|---|---|");
       for (const c of r.reports) {
-        if (c.error) { console.log(`| ${c.call} | — | — | — | — | — | — | — | error: ${c.error} |`); continue; }
-        const lb = c.labels.skipped ? "skipped" : c.labels.error ? "error: "+c.labels.error : `${c.labels.segments} seg, ${c.labels.labels_ok?"fixed set ok":"BAD LABEL"}`;
-        const j = (a) => a.length ? a.join("<br>") : "none";
-        console.log(`| ${c.call} | ${c.words} | ${c.bleeped_share} | ${j(c.leaks)} | ${j(c.transcript_leaks)} | ${j(c.second_pass)} | ${lb} | ${(c.llm.cost_usd + (c.labels.cost_usd||0)).toFixed(4)} | ${c.pitch} |`);
+        if (c.error) { console.log(`| ${c.call} | — | — | — | — | — | error: ${c.error} | — | — | — | — |`); continue; }
+        const k = c.clips || {};
+        const j = (a) => a && a.length ? a.join("<br>") : "none";
+        const lb = k.skipped ? "skipped" : `${k.clips} (${k.labels || "—"})${k.labels_ok ? "" : " INVALID"}${k.errors && k.errors.length ? " err: " + k.errors.join("; ") : ""}`;
+        const st = k.skipped ? "—" : `${k.stable_across_runs ? "yes" : "NO"} (${k.valid_runs}/${k.runs})`;
+        console.log(`| ${c.call} | ${c.duration_min} | ${c.bleeped_share} | ${j(c.leaks)} | ${j(c.transcript_leaks)} | ${j([...(c.second_pass||[]), ...(k.clip_second_pass||[])])} | ${lb} | ${st} | ${k.skipped ? "—" : j(k.coaching_pii)} | ${c.over_bleeped_words ?? "—"} | ${(c.llm.cost_usd + (k.cost_usd||0)).toFixed(4)} |`);
       }' "$OUT/eval-report.json"
     echo
-    echo "Listen: \`sample-redactor/fixtures/out/*.redacted.mp3\` · read: \`*.redacted.txt\`, \`*.labels.json\`, \`*.coaching.json\`."
+    echo "Listen: \`sample-redactor/fixtures/out/*.redacted.mp3\` and \`*.clips/cN.mp3\` · read: \`*.redacted.txt\`, \`*.clips.json\`, \`*.coaching.json\`."
   fi
   echo
   echo "Logs: \`sample-redactor/fixtures/out/$(basename "$LOGDIR")/\` (no secrets; test-call values are fictional)."
