@@ -39,6 +39,7 @@ storage: sample-src/<job_id>/ (scratch) · training-library/<job_id>/ (results) 
 npm ci                                       # also checks the ffmpeg binary for THIS machine's architecture
 npm run check -- --bridge                    # env present, ffmpeg runs, one signed poll works → must print "ok": true
 docker compose -f deploy/docker-compose.yml up -d --build    # restart: unless-stopped, read-only, log rotation
+#   runbook for the live host (go-live order, secret hand-over, logs, update, rollback): docs/OPERATIONS.md
 #   or systemd: deploy/ai-redactor.service   (Restart=always, runs the check before every start)
 ```
 
@@ -54,7 +55,7 @@ docker compose -f deploy/docker-compose.yml up -d --build    # restart: unless-s
 
 **Host:**
 - **Network:** outbound HTTPS only, to the bridge, Supabase signed storage URLs, Telnyx recording links, AssemblyAI and OpenRouter. Firewall all inbound except SSH.
-- **Size:** 1 vCPU / 1 GB for 2 jobs at a time.
+- **Size:** 1 vCPU / 2 GB RAM for 2 jobs at a time. A 60-min call peaks near 300 MB in `/tmp` and 0.5 GB of memory.
 - **ffmpeg:** `ffmpeg-static` downloads the binary for the build machine's architecture (x86-64 or arm64, e.g. Hetzner CAX). Run `npm run check` on the host or inside the image.
 - **Instances:** run one. Two are safe (the claim is a compare-and-swap) but double the poll load, about 130k bridge calls a month each at `POLL_S=20`.
 - **Restarts:** SIGTERM fails running jobs as "worker restarted; retry the job" within ~25 s.
