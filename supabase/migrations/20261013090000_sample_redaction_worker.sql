@@ -20,7 +20,7 @@
 -- Paths never contain calls.id: agents can read published training_library_calls rows (RL-1), so audio paths use the job id.
 -- Effect on existing data: none. Precondition: sample_redaction_jobs is empty (nothing writes it before this lands).
 -- Manifest: 2026-10-12.3 adds both triggers to triggers_enabled. ORDER: apply BEFORE redeploying integrity-audit.
--- Rollback: scripts/rollbacks/rollback_20261013050000_sample_redaction_worker.sql (RL-1 objects stay as RL-1 made them).
+-- Rollback: scripts/rollbacks/rollback_20261013090000_sample_redaction_worker.sql (RL-1 objects stay as RL-1 made them).
 
 SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '30s';

@@ -172,10 +172,10 @@ wiring() {
     awk -v f="[functions.$f]" '$0==f{getline; if ($0 ~ /verify_jwt = false/) ok=1} END{exit !ok}' supabase/config.toml \
       && echo "config.toml: $f verify_jwt=false" || { echo "config.toml: $f entry missing"; return 1; }
   done
-  [ -f scripts/rollbacks/rollback_20261013050000_sample_redaction_worker.sql ] || { echo "rollback missing"; return 1; }
+  [ -f scripts/rollbacks/rollback_20261013090000_sample_redaction_worker.sql ] || { echo "rollback missing"; return 1; }
   local dup; dup="$(ls supabase/migrations | sed -n 's/^\([0-9]\{14\}\)_.*/\1/p' | sort | uniq -d)"
   [ -z "$dup" ] && echo "no duplicate migration versions" || { echo "duplicate migration versions: $dup"; return 1; }
-  if grep -qiE 'update +(public\.)?feature_flags|insert +into +(public\.)?feature_flags' supabase/migrations/20261013050000_sample_redaction_worker.sql; then
+  if grep -qiE 'update +(public\.)?feature_flags|insert +into +(public\.)?feature_flags' supabase/migrations/20261013090000_sample_redaction_worker.sql; then
     echo "migration writes feature_flags"; return 1; fi
   echo "rollback present; migration flips no flags"
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 20261013050000_sample_redaction_worker on a throwaway Postgres, never a real database:
+# 20261013090000_sample_redaction_worker on a throwaway Postgres, never a real database:
 #   RL-1 fixture -> RL-1 migration -> this migration -> re-run refused -> cases -> month-cap race
 #   -> RL-1's own cases still pass on top -> rollback leaves RL-1 intact -> rollback twice -> re-apply.
 # Usage: bash supabase/tests/sample_redaction/run.sh   (PostgreSQL 15+; PGBIN overrides the lookup)
@@ -13,8 +13,8 @@ B="$(mktemp -d "${TMPDIR:-/tmp}/pgt_srw.XXXX")"; PORT="${PORT:-5464}"
 trap '"$PGBIN/pg_ctl" -D "$B/data" -m immediate stop >/dev/null 2>&1 || true; rm -rf "$B"' EXIT
 P=("$PGBIN/psql" -X -h "$B" -p "$PORT" -U postgres -d postgres -v ON_ERROR_STOP=1 -q)
 RL1="$ROOT/supabase/migrations/20261012180000_training_library.sql"
-M="$ROOT/supabase/migrations/20261013050000_sample_redaction_worker.sql"
-R="$ROOT/scripts/rollbacks/rollback_20261013050000_sample_redaction_worker.sql"
+M="$ROOT/supabase/migrations/20261013090000_sample_redaction_worker.sql"
+R="$ROOT/scripts/rollbacks/rollback_20261013090000_sample_redaction_worker.sql"
 
 "${P[@]}" -f "$ROOT/supabase/tests/training_library/_fixture.sql"
 "${P[@]}" -1 -f "$RL1"

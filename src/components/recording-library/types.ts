@@ -1,5 +1,5 @@
 // Rows of the Recording Library tables: RL-1 (20261012180000_training_library) plus the worker columns of
-// 20261013050000_sample_redaction_worker. Not in the generated types.ts until it is regenerated after apply.
+// 20261013090000_sample_redaction_worker. Not in the generated types.ts until it is regenerated after apply.
 
 export type JobStatus = "queued" | "fetching" | "transcribing" | "redacting" | "verifying" | "done" | "failed" | "deleted";
 

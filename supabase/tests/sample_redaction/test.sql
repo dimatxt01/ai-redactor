@@ -1,4 +1,4 @@
--- 20261013050000_sample_redaction_worker cases, on top of RL-1 (run.sh applies the RL-1 fixture + RL-1 migration first).
+-- 20261013090000_sample_redaction_worker cases, on top of RL-1 (run.sh applies the RL-1 fixture + RL-1 migration first).
 -- Each block asserts; any failure raises and stops the run (ON_ERROR_STOP).
 \set ON_ERROR_STOP 1
 CREATE OR REPLACE FUNCTION pg_temp.as_user(p uuid) RETURNS void LANGUAGE sql AS $$ SELECT set_config('request.jwt.claim.sub', coalesce(p::text,''), false) $$;

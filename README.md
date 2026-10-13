@@ -1,7 +1,7 @@
 # ai-redactor
 
 The Recording Library's in-house redaction + coaching worker for TrueRing. This is an extract for review from the private TrueRing
-monorepo: branch `feat/sample-redaction` @ `0adfdaa1`, rebased on main `390ea1f5`.
+monorepo: branch `feat/sample-redaction` @ `90e3c8dc`, rebased on main `a186e623`.
 **Nothing here is applied or deployed.** It builds on RL-1, which is already live on main.
 
 Every file keeps its monorepo path, so this tree overlays the TrueRing repo one to one.
@@ -10,7 +10,7 @@ Every file keeps its monorepo path, so this tree overlays the TrueRing repo one 
 | Path | What |
 |---|---|
 | `sample-redactor/` | The worker: a separate Vercel project (Next.js + Vercel Workflow + ffmpeg). `SPEC.md` is main's v0.2, byte for byte. |
-| `supabase/migrations/20261013050000_sample_redaction_worker.sql` | **New.** Extends RL-1 with `ALTER TABLE`: worker, cap and takedown columns, month-cap functions, `sample_library_ingest`, two guard triggers. Rollback: `scripts/rollbacks/rollback_20261013050000_…` |
+| `supabase/migrations/20261013090000_sample_redaction_worker.sql` | **New.** Extends RL-1 with `ALTER TABLE`: worker, cap and takedown columns, month-cap functions, `sample_library_ingest`, two guard triggers. Rollback: `scripts/rollbacks/rollback_20261013090000_…` |
 | `supabase/functions/sample-redaction-bridge/` | RL-3: the worker's only way into TR (HMAC). It replaces the signed callback (Dmitry, 2026-10-13). |
 | `supabase/functions/training-library-admin/` | RL-2/4/5 staff actions: pick, submit, retry, sweep, link, review, publish, withdraw, edit, delete every copy. |
 | `supabase/functions/_shared/sampleSignature.ts`, `telnyxRecording.ts` | New shared helpers. |
@@ -26,7 +26,7 @@ Every file keeps its monorepo path, so this tree overlays the TrueRing repo one 
 - `bash supabase/tests/sample_redaction/run.sh` and `bash supabase/tests/training_library/run.sh`, with local PostgreSQL 15+.
 - `npx -y deno@2.9.6 run supabase/tests/sample_signature_parity.ts`.
 
-The edge functions and the frontend page import TrueRing code that isn't in this extract, so the full `npm run validate` runs from the monorepo worktree. Its last run on `0adfdaa1` passed all 18 offline checks, with 3 skipped: the two installs, and the real-vendor eval, which needs API keys. The eval's plumbing was dry-run against local fake vendors.
+The edge functions and the frontend page import TrueRing code that isn't in this extract, so the full `npm run validate` runs from the monorepo worktree. Its last run on `90e3c8dc` passed all 18 offline checks, with 3 skipped: the two installs, and the real-vendor eval, which needs API keys. The eval's plumbing was dry-run against local fake vendors.
 
 ## Review focus
 

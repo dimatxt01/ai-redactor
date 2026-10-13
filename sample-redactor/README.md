@@ -96,7 +96,7 @@ Every JSON result is an envelope `{schema, schema_version: "1.0", pipeline_versi
 
 | # | Finding | Done |
 |---|---|---|
-| B1 | `create table if not exists` no-ops on RL-1 | Removed. `20261013050000_sample_redaction_worker.sql` uses `ALTER TABLE … ADD COLUMN` on RL-1 with no `if not exists`. It has preconditions (RL-1 applied, table empty, re-run refused) and keeps RL-1's status list (incl. `deleted`) and key check. |
+| B1 | `create table if not exists` no-ops on RL-1 | Removed. `20261013090000_sample_redaction_worker.sql` uses `ALTER TABLE … ADD COLUMN` on RL-1 with no `if not exists`. It has preconditions (RL-1 applied, table empty, re-run refused) and keeps RL-1's status list (incl. `deleted`) and key check. |
 | B2 | Own library tables | Dropped. Writes go to `training_library_calls` (`pending_qa`, `coaching` jsonb), `_call_sources` (`consent_id` FK) and `_clips`. Reviews go to `training_library_reviews`. |
 | B3 | Own buckets | Dropped. RL-1's `sample-src` and `training-library` are used. |
 | B4 | v0.2 §6–7 clips + coaching | Built (pipeline steps 7–8 above). The highlight is gone. |
@@ -145,7 +145,7 @@ Outputs: `fixtures/out/*.redacted.mp3`, `*.clips/cN.mp3`, `*.redacted.txt`, `*.c
 
 Branch `feat/sample-redaction`: `git diff origin/main...feat/sample-redaction`. Suggested order:
 
-1. `supabase/migrations/20261013050000_sample_redaction_worker.sql` (on RL-1) + `supabase/tests/sample_redaction/`.
+1. `supabase/migrations/20261013090000_sample_redaction_worker.sql` (on RL-1) + `supabase/tests/sample_redaction/`.
 2. `supabase/functions/sample-redaction-bridge/index.ts`: claim CAS, key check, run ownership, tombstone, cost ledger, 2h deadline, `complete` → `sample_library_ingest`.
 3. `supabase/functions/training-library-admin/index.ts`: pick, submit, review evidence, publish, takedown.
 4. `sample-redactor/workflows/redact-call.ts` + `steps.ts`.
@@ -173,7 +173,7 @@ Prerequisites outside the repo:
 
 ## Rollout order (each step its own go)
 
-1. Apply `supabase/migrations/20261013050000_sample_redaction_worker.sql` (`apply-migration` skill, after RL-1). Then redeploy `integrity-audit`: manifest 2026-10-12.3 expects the two new triggers, so deploying it first would alarm.
+1. Apply `supabase/migrations/20261013090000_sample_redaction_worker.sql` (`apply-migration` skill, after RL-1). Then redeploy `integrity-audit`: manifest 2026-10-12.3 expects the two new triggers, so deploying it first would alarm.
 2. Set the TR secrets. Deploy `training-library-admin`, `sample-redaction-bridge` and `ops-alert` (new `sample_cost_cap` key).
 3. Create the Vercel project from `sample-redactor/`, set its env, deploy, and check `GET /api/health`.
 4. Deploy the frontend: `/am/recording-library` and `/admin/recording-library`, hidden while the flag is off.
@@ -183,5 +183,5 @@ Rollback, in order:
 1. Disarm `recording_library`. Submit is refused from then on.
 2. Unset `SAMPLE_REDACTOR_URL`, or delete the Vercel project.
 3. Undeploy the two functions and redeploy the previous `ops-alert`.
-4. Run `scripts/rollbacks/rollback_20261013050000_sample_redaction_worker.sql`. RL-1 stays as it is.
+4. Run `scripts/rollbacks/rollback_20261013090000_sample_redaction_worker.sql`. RL-1 stays as it is.
 5. Revert manifest 2026-10-12.3.

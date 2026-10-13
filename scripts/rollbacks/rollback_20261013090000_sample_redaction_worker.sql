@@ -1,4 +1,4 @@
--- Rollback for 20261013050000_sample_redaction_worker.sql. Leaves RL-1 (20261012180000) exactly as RL-1 made it.
+-- Rollback for 20261013090000_sample_redaction_worker.sql. Leaves RL-1 (20261012180000) exactly as RL-1 made it.
 -- Drops the worker columns, so job spend/run/takedown history is lost: run it only before the pilot, or after
 -- exporting sample_redaction_jobs. Library rows already ingested stay (they are RL-1 rows).
 -- Idempotent: safe to run twice.
