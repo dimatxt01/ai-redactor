@@ -4,7 +4,7 @@ TrueRing's Recording Library worker. It takes an ended sale call (Final Expense,
 
 It is a **plain Node background process**: one long-running container. It opens no port and receives no traffic. It **pulls** its work from TrueRing through one signed endpoint, `sample-redaction-bridge`, and sends every result back the same way.
 
-**Status: nothing deployed.** The TrueRing side's source of truth is `Mahamadou2004/truering` branch **`prb/rl-worker`** (not on main, not deployed). Its contract is [`truering/docs/recording-library/SPEC.md`](truering/docs/recording-library/SPEC.md), mirrored from that branch.
+**Status:** TrueRing's side is deployed from `Mahamadou2004/truering` **main @ `d7671d64`** (the merge of `prb/rl-worker`). The worker runs on one Hetzner host; see [`docs/OPERATIONS.md`](docs/OPERATIONS.md). The contract is [`truering/docs/recording-library/SPEC.md`](truering/docs/recording-library/SPEC.md), mirrored from that commit.
 
 ## How it connects to TrueRing
 
@@ -69,7 +69,7 @@ npm run simulate                  # the whole system on this machine, no keys, n
 npm run validate -- --offline     # every check incl. the simulation; no vendor calls
 npm run validate                  # + the real-vendor eval if ASSEMBLYAI_API_KEY / OPENROUTER_API_KEY are set (~$1.60)
 npm run eval -- --llm-only        # re-check clip labels on the last run's cached redacted lines (cents, no ASR)
-bash truering/check.sh /path/to/truering   # read-only TrueRing-side checks inside a checkout of prb/rl-worker
+bash truering/check.sh /path/to/truering   # read-only TrueRing-side checks inside a checkout of TR main (or the commit in truering/SOURCE)
 ```
 
 Prerequisites: Node 22 and PostgreSQL 15+ (`brew install postgresql@17`). Deno comes via `npx`. Generating the test calls needs macOS `say`.
@@ -78,7 +78,7 @@ Prerequisites: Node 22 and PostgreSQL 15+ (`brew install postgresql@17`). Deno c
 - **Real:** two worker processes, TrueRing's `training-library-admin` and `sample-redaction-bridge` (from the mirror, unchanged, under Deno), and the RL-1 + worker migrations on a throwaway Postgres.
 - **Faked:** only Supabase's HTTP layer, Telnyx, AssemblyAI and OpenRouter. On the verification pass, the fake AssemblyAI listens to the redacted mp3 for the bleep tone, so an unbleeped value stays audible.
 
-It checks, from TrueRing's side (102 checks):
+It checks, from TrueRing's side (105 checks):
 1. **Auth:** wrong secrets are refused; a worker with a wrong secret refuses to start.
 2. **Submit rules:** the flag; Twilio-era and not-yet-ended calls; agents with two verticals or none are refused, never defaulted; the month cap. There is no consent gate.
 3. **The happy path:** queued → done, with clips, coaching and cleanup.
@@ -87,6 +87,7 @@ It checks, from TrueRing's side (102 checks):
 6. **QA gate:** approve is refused until everything was played, then publish works.
 7. **Hard delete:** admin only; rows and files gone, spend kept in the ledger; then the bridge answers `404 NO_JOB`.
 8. **Cancel mid-run:** delete is refused while the job is in flight. Admin cancel → the worker stops on its next poll, deletes the vendor copy and reports `vendor_purged` (the heartbeat clears, the job stays `failed: cancelled`) → delete succeeds.
+   **Kill switch:** with the `recording_library` flag OFF, a queued job is never handed out, and a claim that raced the switch-off gets `409 JOB_TERMINAL` (the worker stops, never fails), with the job ended `failed: cancelled`.
 9. **A worker killed mid-job:** the bridge fails it, the other worker deletes its vendor copy, a retry finishes it (on a **Medicare** call, whose coaching prompt names Medicare). Then the orphan sweep deletes an old unrecorded transcript and keeps a young one, and SIGTERM exits cleanly.
 10. **Privacy:** every planted value is checked as bleeped in the audio and every clip (with a control on the original recording). Every artifact, table and log is searched for planted values, and the worker's temp dirs must be empty.
 
@@ -106,5 +107,5 @@ Output: `sim-out/<time>/report.md`, `storage/` (every file TrueRing would hold, 
 | `fixtures/calls/` | 12 synthetic two-voice calls with planted, fictional PII. |
 | `scripts/` | `validate.sh`, `eval-test-calls.ts` (real vendors), `signature-parity.ts`, `check-ffmpeg.mjs`. |
 | `sim/` | The end-to-end simulation. |
-| `truering/` | Mirror of TrueRing's side from `prb/rl-worker` (never applied from here) + `refresh.sh`, `check.sh`, `SOURCE`. |
+| `truering/` | Mirror of TrueRing's side as deployed (main @ `d7671d64`; never applied from here) + `refresh.sh`, `check.sh`, `SOURCE`. |
 | `docs/DESIGN.md` | The pipeline in detail, how each requirement is met, deviations from SPEC, the review answers. |

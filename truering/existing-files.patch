@@ -1,5 +1,5 @@
 diff --git a/FLAGS.md b/FLAGS.md
-index 5c42c476..477f7ec8 100644
+index 5c42c476..73cfcafa 100644
 --- a/FLAGS.md
 +++ b/FLAGS.md
 @@ -2703,3 +2703,12 @@ Silence (either mode → today, next webhook, cache ≤ 10 s): `update feature_f
@@ -7,16 +7,16 @@ index 5c42c476..477f7ec8 100644
  
  > Note 2026-10-13 (§ unified_login / WL M0b): `my_workspaces()` parity migration `20261013050000_my_workspaces_portal_parity.sql` STAGED, NOT applied — admin/superadmin ⇒ admin + am workspaces. No flag row change. See BUGLOG 2026-10-13 ~05:00Z.
 +
-+## §76 — `recording_library` — internal training Recording Library (added 2026-10-12 by RL-1 / TRU-248, migration `20261012180000_training_library.sql` APPLIED 2026-10-13 01:21Z — row present, **OFF** `{}`; readers STAGED on branch `feat/sample-redaction`, NOT deployed)
++## §76 — `recording_library` — internal training Recording Library (added 2026-10-12 by RL-1 / TRU-248, migration `20261012180000_training_library.sql` APPLIED 2026-10-13 01:21Z — row present, **OFF** `{}`; readers STAGED on branch `prb/rl-worker`, NOT deployed)
 +**Why:** SPEC v0.2 / TR_PLAN: AMs and admins submit ended Sale calls of every vertical (final_expense, medicare, aca; no consent requirement, Dmitry 2026-10-13 12:44 PM) to the in-house redaction worker (separate repo `ai-redactor`, a background process in one container that polls `sample-redaction-bridge`) and QA the redacted call, smart clips and coaching before anything is published to agents.
-+**Readers (this branch):** `training-library-admin` refuses `submit` while OFF (`FLAG_OFF`; retry/review/publish/withdraw/delete keep working so in-flight items can be finished or taken down); the frontend hides the "Recording Library" nav in `/admin` and `/am` and shows a switched-off notice (`src/lib/recordingLibraryFlag.ts`, 60 s cache, unreadable = OFF). Agents see nothing until RL-7 ships, flag or not.
++**Readers (prb/rl-worker):** `training-library-admin` refuses submit, retry, pick, link, review, publish and edit while OFF (`FLAG_OFF`); cancel, delete, sweep and withdraw keep working so in-flight items can be stopped, cleaned up or removed. `sample-redaction-bridge` `poll` hands the worker no jobs while OFF (`jobs: []`), while stop, lost and cleanup still run so a cancel or a vendor cleanup can finish. `claim` of a still-queued job while OFF ends it as `failed:cancelled` and answers `JOB_TERMINAL`. Flag reads in both functions use `maxErrorStaleMs` 30 s, so a feature_flags read outage cannot keep a stale ON alive. Browser roles cannot write `sample_redaction_jobs` or the library rows (`training_library_calls`, `_call_sources`, `_clips`, `_reviews`) at all: RL-1's staff INSERT/UPDATE policies and grants are dropped by `20261013090000` (critic C1 and its #352 follow-up), so the gate cannot be bypassed through PostgREST. The frontend hides the "Recording Library" nav in `/admin` and `/am` and shows a switched-off notice (`src/lib/recordingLibraryFlag.ts`, 60 s cache, unreadable = OFF). Agents see nothing until RL-7 ships, flag or not.
 +**Signal:** `select status, count(*), sum(cost_usd) from sample_redaction_jobs where created_at > date_trunc('month', now()) group by 1;` and `select count(*) from security_activity_log where event_type = 'sample_cost_cap_blocked' and created_at > now() - interval '1 day';` (ops-alert key `sample_cost_cap`).
 +**Scale:** staff-only page; at most one worker run per submit; spend capped at $2/job and $100/month (`SAMPLE_JOB_CAP_USD`, `SAMPLE_MONTH_CAP_USD`).
-+Arm (own go, after migration `20261013090000`, the two functions and the worker are live): `update feature_flags set enabled = true where key = 'recording_library';`
-+Silence: `update feature_flags set enabled = false where key = 'recording_library';` (submit refused from the next request; nav hidden within 60 s).
-+**Manifest:** RL-1 (2026-10-12.1) put the flag in `flags.known_optional`; 2026-10-12.3 adds the triggers `sample_redaction_jobs_service_columns` and `sample_redaction_takedown_guard`.
++Arm (own go, after migration `20261013090000`, the two functions and the worker are live, AND the worker's `check.ts --bridge` printed `"ok": true` and its alive file is ≤180 s old): `update feature_flags set enabled = true where key = 'recording_library';`
++Silence: `update feature_flags set enabled = false where key = 'recording_library';` (submit, retry, pick, link, review, publish, edit refused from the next request (≤10 s flag cache); cancel, delete, sweep, withdraw keep working; nav hidden within 60 s).
++**Manifest:** RL-1 (2026-10-12.1) put the flag in `flags.known_optional`; 2026-10-12.3 adds the trigger `sample_redaction_jobs_service_columns` (the takedown guard was removed with the hard delete, Dmitry 2026-10-13 12:44 PM).
 diff --git a/docs/recording-library/SPEC.md b/docs/recording-library/SPEC.md
-index 9bacdd6c..d3019291 100644
+index 9bacdd6c..22c7ac33 100644
 --- a/docs/recording-library/SPEC.md
 +++ b/docs/recording-library/SPEC.md
 @@ -1,7 +1,7 @@
@@ -38,7 +38,7 @@ index 9bacdd6c..d3019291 100644
  }
  ```
  - `agent_ref` is a pseudonym. The service never receives agent names except in `extra_terms`, which are the terms to bleep.
-@@ -112,84 +112,70 @@ Sample submit payload:
+@@ -112,84 +112,72 @@ Sample submit payload:
  - **PII spans:** `[{type, start_ms, end_ms, channel, confidence, detector:"model"|"regex"|"digit_run"|"extra_term", padded_start_ms, padded_end_ms}]`. They contain **no original text**.
  - **Status:** `queued` → `fetching` → `transcribing` → `redacting` → `verifying` → `done` | `failed` (with `error_code`: `fetch_expired` | `bad_audio` | `asr_failed` | `timeout`).
  
@@ -97,6 +97,8 @@ index 9bacdd6c..d3019291 100644
 +- `fetch_expired` → retry queues the job again with the same key; the bridge's `source` hands out a fresh link.
 +- **Cancel** (admin/superadmin, Dmitry 2026-10-13 1:41 PM): marks the call's queued/running jobs `failed:cancelled`; the worker aborts the run when the next poll lists it in `stop`. The worker has no cancel endpoint and nothing is deleted on its side; the run may still report spend already incurred.
  - A job running over 2 h is marked `failed:timeout`.
++- **Flag `recording_library`:** gates submit, retry, pick, link, review, publish and edit (403 `FLAG_OFF`). The bridge's `poll` hands out no jobs while OFF (`jobs: []`); stop and cleanup still run. `claim` while OFF ends a still-queued job as `failed:cancelled` (409 `JOB_TERMINAL`). Browser roles have no INSERT/UPDATE on `sample_redaction_jobs` or on the library rows (calls, call sources, clips, reviews); all those writes are service_role through the edge functions. Cancel, delete, sweep and withdraw stay ungated, so stopping and cleanup work with the flag OFF. The flag goes ON only after the worker's `check.ts --bridge` printed `"ok": true` and its alive file is fresh (≤180 s); otherwise submits sit queued and hold their cost reservation until the 2 h sweep.
++- **Deploy order:** the migration goes before the `integrity-audit` redeploy (manifest 2026-10-12.3).
  
  **Storage:**
 -- Private Supabase bucket `sample-library`. The service's signed links are only for TR to copy from.
@@ -150,7 +152,7 @@ index 9bacdd6c..d3019291 100644
  
  **Fits:** orchestration.
  - Webhook node: submit, plus an HMAC check in a Code node.
-@@ -209,6 +195,8 @@ Callback (POST to `callback_url`):
+@@ -209,6 +197,8 @@ Callback (POST to `callback_url`):
  - **Clips and coaching:** one LLM call per call (segmentation + coaching JSON with a schema check in a Code node), then an ffmpeg cut per clip. This adds about 1–2 min per call.
  - **Recommended shape:** n8n for orchestration, AssemblyAI (audio redaction built in) or Deepgram plus an ffmpeg worker, regex and LLM in Code/HTTP nodes.
  
@@ -159,7 +161,7 @@ index 9bacdd6c..d3019291 100644
  ## Open items to verify
  - Customer and agent channel order in the dual-channel mp3.
  - Sample rate and bitrate. Probe with `ffprobe` on a freshly re-signed link during the pilot.
-@@ -224,7 +212,7 @@ Callback (POST to `callback_url`):
+@@ -224,7 +214,7 @@ Callback (POST to `callback_url`):
    - Transcribe each channel separately; this gives speaker labels for free.
  - **Idempotency:**
    - `POST /jobs` with an existing `idempotency_key` returns the existing job (same `job_id`); the job never runs twice.
@@ -168,7 +170,7 @@ index 9bacdd6c..d3019291 100644
  - **Length and timeouts:**
    - Plan for **60 min max** (49-min calls exist), about 60 MB mp3. Reject anything over 90 min with `bad_audio:too_long`.
    - Everything is async: speech-to-text through the vendor's async API with a webhook or polling, never a synchronous HTTP call.
-@@ -246,17 +234,21 @@ Callback (POST to `callback_url`):
+@@ -246,17 +236,21 @@ Callback (POST to `callback_url`):
    - TR stores `schema_version` on each job.
  - **Test fixtures:**
    - 10–15 **synthetic** two-channel calls (TTS or staff role-play) with PII planted at known timestamps: names, phone, address, DOB, SSN, card, MBI, digits spelled out and read back, crosstalk, and a 45–50 min long call.
@@ -196,7 +198,7 @@ index 9bacdd6c..d3019291 100644
 +    - **Stale zombie run:** a run whose heartbeat has been stale for more than `SAMPLE_WORKER_STALE_S` (default 300 s) is treated as dead. If it later posts `cost` after the call was deleted, it gets `NO_JOB` and that spend is not recorded in the month cap. Inherent to the hard delete; expected to be cents.
 +    - **Follow-up (not done):** service_role keeps RL-1's `GRANT ALL` on `sample_redaction_jobs` and `training_library_reviews`, so a direct `DELETE`/`TRUNCATE` with the service key bypasses the spend ledger and append-only reviews. The edge functions only use the RPCs. Hardening service_role's rights is a later PR.
 diff --git a/docs/recording-library/TR_PLAN.md b/docs/recording-library/TR_PLAN.md
-index d6ce2880..8d4f2289 100644
+index d6ce2880..42ee7cbf 100644
 --- a/docs/recording-library/TR_PLAN.md
 +++ b/docs/recording-library/TR_PLAN.md
 @@ -1,7 +1,13 @@
@@ -236,7 +238,7 @@ index d6ce2880..8d4f2289 100644
 -| 6 | **Agent consent** | A one-time training-use release card in `/agent` (text version, time) with revoke; revoking withdraws that agent's items. The AM page shows consent status and can record a consent obtained offline. | flag | 1 d | 1 | Release text (Dmitry/Mo). Frontend deploy go. |
 -| 7 | **Agent "Recording Library" tab** | Read-only in `/agent` (reuse the `ai-training` slot). Filter by label (opener / discovery / objection: price… / close). Clip cards: player, AI coaching note, scores, the per-call summary. Pseudonymized agents, no downloads. **Vote each clip/call up (+1, green arrow) or down (-1, red arrow) + optional comment** (upsert, own rating only, never shows others' ratings). Optional: also mount read-only browsing in AM View. | flag | 2.5 d | 1, 4, 5 (published content) | Frontend deploy go |
 -| 8 | **Ops** | Retention job (`sample-src` cleanup, yearly review), callback-failure alert, BUGLOG runbook. | — | 0.5 d | 3 | Deploy go |
-+| 2 | **Edge: `training-library-admin` (submit, retry, sweep, pick, review, publish, withdraw, edit, delete)** — *in `prb/rl-worker` (PR #347), not on main, not deployed* | AM/admin JWT check. Rules: ended `Sale`, any vertical (from the agent), Telnyx, ≤60 min, no consent; flag `recording_library` gates submit. Idempotency key `call:<id>:v<n>`; the estimate is reserved against the $100/month cap in SQL; submit only queues (the worker polls). Admin-only `cancel` and hard `delete` (409 `IN_FLIGHT` until stopped; spend kept in `sample_spend_ledger`). Migration `20261013090000_sample_redaction_worker` adds the worker columns (incl. `heartbeat_at`), caps, ledger, `sample_library_ingest` and `sample_call_hard_delete` on top of RL-1. | flag | drafted (prb/rl-worker) | 1 | Optional secrets: caps, `SAMPLE_WORKER_STALE_S`. Migration go, deploy go. |
++| 2 | **Edge: `training-library-admin` (submit, retry, sweep, pick, review, publish, withdraw, edit, delete)** — *in `prb/rl-worker` (PR #347), not on main, not deployed* | AM/admin JWT check. Rules: ended `Sale`, any vertical (from the agent), Telnyx, ≤60 min, no consent; flag `recording_library` gates submit, retry, pick, link, review, publish, edit (cancel, delete, sweep, withdraw ungated). Idempotency key `call:<id>:v<n>`; the estimate is reserved against the $100/month cap in SQL; submit only queues (the worker polls). Admin-only `cancel` and hard `delete` (409 `IN_FLIGHT` until stopped; spend kept in `sample_spend_ledger`). Migration `20261013090000_sample_redaction_worker` adds the worker columns (incl. `heartbeat_at`), caps, ledger, `sample_library_ingest` and `sample_call_hard_delete` on top of RL-1. | flag | drafted (prb/rl-worker) | 1 | Optional secrets: caps, `SAMPLE_WORKER_STALE_S`. Migration go, deploy go. |
 +| 3 | **Edge: `sample-redaction-bridge`** (replaces the callback) — *in `prb/rl-worker` (PR #347), not on main, not deployed* | `verify_jwt=false`. HMAC ±5 min, one secret (worker → TR only). `poll`: jobs to claim, heartbeats, stop list, vendor cleanup list. Claim = compare-and-swap (one run per job); every later action must come from that run. Fresh Telnyx link per attempt; the worker downloads at once. Signed upload/download URLs only under `sample-src/<job_id>/` and `training-library/<job_id>/`. `complete` checks every file is uploaded, then `sample_library_ingest` writes the job, `training_library_calls`, `_call_sources` and `_clips` in one transaction. Scratch is deleted when the job ends. | — | drafted (prb/rl-worker) | 1, 2 | **Secret** `SAMPLE_REDACTOR_BRIDGE_SECRET`. Deploy go. Critic focus: HMAC, run ownership, heartbeat/stop. |
 +| 4 | **Links** — staff part *in `prb/rl-worker` (PR #347), not on main, not deployed* (`training-library-admin` `link`) | 10-min signed links, access logged; the log is the reviewer's listen evidence. Staff: everything. **Agents: (planned; not drafted), build with RL-7** (published clips only, no full call, decide in Q3). | — | 0.5 d (agents) | 1, 3 | Deploy go |
 +| 5 | **AM/Admin curation page** (`/admin/recording-library` + `/am/recording-library`, one component `RecordingLibrary.tsx` with `portal="am"`; both mounts in `src/App.tsx` on prb/rl-worker, not merged to main, not deployed) — *in `prb/rl-worker` (PR #347), not on main, not deployed* | **Pick:** ended sales of every vertical, filtered by agent, 10–40 min. **Submit.** **Jobs list** with retry and admin-only cancel. **QA view:** full-call player with bleep markers, clip list with labels and coaching, second-pass flags, edit clip titles, drop a clip, the "listened to full call + all clips" box (required). **Publish/withdraw.** **Manifest export.** **Ratings view:** per item, up count, down count, net score and comments (AM/admin only). | flag + AM/admin role | 3.5 d | 1–4 | Frontend deploy go |
@@ -396,6 +398,23 @@ index fbce6fbd..dbc35a33 100644
 +# Recording library RL-3: ai-redactor worker (separate repo, a background process that polls this function) => verify_jwt=false; in-body guard: X-TR-Signature HMAC (SAMPLE_REDACTOR_BRIDGE_SECRET, ±300s, missing secret rejects)
 +[functions.sample-redaction-bridge]
 +verify_jwt = false
+diff --git a/supabase/functions/_shared/featureFlags.ts b/supabase/functions/_shared/featureFlags.ts
+index 463f1450..c1cccfa2 100644
+--- a/supabase/functions/_shared/featureFlags.ts
++++ b/supabase/functions/_shared/featureFlags.ts
+@@ -61,8 +61,11 @@ export async function loadFlags(
+ export async function flagEnabled(
+   supabase: SupabaseClient,
+   key: string,
++  // Optional, for kill switches that gate spend/work (e.g. recording_library): on a read error, a cache older than
++  // this bound reads OFF instead of last-known. Omitted = fleet default (last-known indefinitely), unchanged.
++  opts?: { maxErrorStaleMs?: number },
+ ): Promise<boolean> {
+-  const flags = await loadFlags(supabase);
++  const flags = await loadFlags(supabase, false, opts);
+   return flags[key]?.enabled === true;
+ }
+ 
 diff --git a/supabase/functions/integrity-audit/manifest.json b/supabase/functions/integrity-audit/manifest.json
 index 61af2159..871676e5 100644
 --- a/supabase/functions/integrity-audit/manifest.json

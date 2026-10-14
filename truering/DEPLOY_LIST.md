@@ -11,7 +11,19 @@ Folded in: prb/rl-pull-docs (#345, docs) and the pull model from #348 (closed).
 5. **Edge `ops-alert`** (key `sample_cost_cap`). CLI deploy from clean main.
 6. **Frontend**: `/admin/recording-library` + `/am/recording-library`. `vercel --prod`, critic's live screenshots, deploy_records row, BUGLOG entry.
 7. **Worker container** (ai-redactor `Dockerfile`, separate repo, plain Node, no open port; polls the bridge every ~20 s, about 130k function calls/month): env `TR_BRIDGE_URL`, `SAMPLE_REDACTOR_BRIDGE_SECRET`, `ASSEMBLYAI_API_KEY`, `OPENROUTER_API_KEY`. Check before it counts as up: `node --import tsx src/check.ts --bridge` prints `"ok": true`.
-8. **Flag `recording_library` stays OFF.** Turning it on is a separate Dmitry go.
+8. **Flag `recording_library` stays OFF.** Turning it on is a separate Dmitry go, and only **after** the worker is up:
+   `node --import tsx src/check.ts --bridge` printed `"ok": true` against prod, and the worker's alive file
+   (`ALIVE_FILE`, default `/tmp/ai-redactor-alive`) is fresh (written within the last 180 s, the container HEALTHCHECK).
+   With the flag ON and no worker, submits sit queued and hold their cost reservation until the 2 h sweep.
+   The flag gates submit, retry, pick, link, review, publish and edit (403 `FLAG_OFF`); cancel, delete, sweep and
+   withdraw stay ungated so stopping and cleanup work with the flag OFF.
+   The bridge `poll` returns `jobs: []` while OFF (stop/cleanup still run), and the migration removes browser INSERT/UPDATE on
+   `sample_redaction_jobs` and on the library rows (critic C1 + #352 follow-up), so nothing can be queued, re-queued or
+   published around the flag. `claim` while OFF cancels a still-queued job (JOB_TERMINAL). Do not start the worker before
+   this bridge version is deployed.
+
+**Order rule:** the migration (1) goes **before** the `integrity-audit` redeploy (manifest 2026-10-12.3); a redeploy
+first makes the audit report the new manifest objects as missing.
 
 Rollback order: flag off → stop the worker → undeploy the two functions → rollback SQL (`psql -1`). RL-1 stays.
 

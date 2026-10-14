@@ -61,7 +61,7 @@ BEGIN
 END $$;
 RESET ROLE;
 
--- ===== 3. browser staff (RL-1 lets AMs write jobs) cannot touch worker columns =====
+-- ===== 3. browser staff cannot write jobs at all (critic C1; the service-columns trigger stays as a second layer) =====
 SET ROLE authenticated; SELECT pg_temp.as_user('22222222-0000-0000-0000-0000000000a3');
 SELECT pg_temp.expect_fail($q$INSERT INTO sample_redaction_jobs (call_id, version, idempotency_key, reserved_usd) VALUES ('cccccccc-0000-0000-0000-000000000003', 1, 'call:cccccccc-0000-0000-0000-000000000003:v1', 5)$q$, 'AM inserting a job with a reservation');
 SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET cost_usd = 0 WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM resetting spend');
@@ -69,9 +69,7 @@ SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET reserved_usd = 0 
 SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET workflow_run_id = 'wrun_evil' WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM hijacking the run');
 SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET heartbeat_at = now() WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM faking a worker heartbeat');
 SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET created_at = now() - interval '40 days' WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM moving a job out of the month');
-UPDATE sample_redaction_jobs SET qa_reasons = '["note"]' WHERE call_id = 'cccccccc-0000-0000-0000-000000000002';
-DO $$ BEGIN IF (SELECT qa_reasons FROM sample_redaction_jobs WHERE call_id = 'cccccccc-0000-0000-0000-000000000002') <> '["note"]' THEN RAISE EXCEPTION 'FAIL RL-1 staff write'; END IF;
-  RAISE NOTICE 'ok: AM still writes RL-1 columns'; END $$;
+SELECT pg_temp.expect_fail($q$UPDATE sample_redaction_jobs SET qa_reasons = '["note"]' WHERE call_id = 'cccccccc-0000-0000-0000-000000000002'$q$, 'AM writing an RL-1 column (no browser writes since C1)');
 RESET ROLE;
 SET ROLE anon;
 SELECT pg_temp.expect_fail($q$SELECT public.sample_job_insert('cccccccc-0000-0000-0000-000000000003', 1, 'final_expense', '{}', '{}', null, 0, 100)$q$, 'anon calling sample_job_insert');
@@ -278,4 +276,43 @@ BEGIN
   IF (public.sample_library_ingest(j, 'wrun_1', '{}'::jsonb))->>'reason' <> 'not_found' THEN RAISE EXCEPTION 'FAIL ingest after hard delete'; END IF;
   RAISE NOTICE 'ok: service_role hard delete cascades (sources, clips, reviews); ingest of a deleted job id returns not_found';
 END $$;
+RESET ROLE;
+
+-- ===== C1: browser roles never write jobs (AM INSERT/UPDATE -> 42501; admin too; SELECT kept) =====
+INSERT INTO sample_redaction_jobs (id, call_id, idempotency_key, status, error_code)
+  VALUES ('dddddddd-0000-0000-0000-0000000000c1','cccccccc-0000-0000-0000-000000000006','call:cccccccc-0000-0000-0000-000000000006:v1','failed','internal');
+CREATE OR REPLACE FUNCTION pg_temp.expect_42501(p_sql text, p_what text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  BEGIN EXECUTE p_sql; EXCEPTION WHEN insufficient_privilege THEN RAISE NOTICE 'ok: % refused (42501)', p_what; RETURN;
+    WHEN OTHERS THEN RAISE EXCEPTION 'FAIL: % refused with % instead of 42501', p_what, SQLSTATE; END;
+  RAISE EXCEPTION 'FAIL: % was allowed', p_what;
+END $$;
+GRANT EXECUTE ON FUNCTION pg_temp.expect_42501(text,text) TO authenticated, anon;
+SET ROLE authenticated; SELECT pg_temp.as_user('22222222-0000-0000-0000-0000000000a3');   -- AM
+SELECT pg_temp.expect_42501($q$INSERT INTO sample_redaction_jobs (call_id, idempotency_key, status) VALUES ('cccccccc-0000-0000-0000-000000000005','call:cccccccc-0000-0000-0000-000000000005:v1','queued')$q$, 'AM direct INSERT of a queued job');
+SELECT pg_temp.expect_42501($q$UPDATE sample_redaction_jobs SET status='queued', vertical='medicare' WHERE id='dddddddd-0000-0000-0000-0000000000c1'$q$, 'AM UPDATE failed -> queued');
+DO $$ BEGIN IF (SELECT count(*) FROM sample_redaction_jobs WHERE id='dddddddd-0000-0000-0000-0000000000c1') <> 1 THEN RAISE EXCEPTION 'FAIL AM lost SELECT on jobs'; END IF; RAISE NOTICE 'ok: AM still reads jobs'; END $$;
+SELECT pg_temp.as_user('22222222-0000-0000-0000-0000000000ad');   -- admin
+SELECT pg_temp.expect_42501($q$UPDATE sample_redaction_jobs SET status='queued' WHERE id='dddddddd-0000-0000-0000-0000000000c1'$q$, 'admin UPDATE failed -> queued');
+RESET ROLE;
+SET ROLE anon;
+SELECT pg_temp.expect_42501($q$INSERT INTO sample_redaction_jobs (call_id, idempotency_key) VALUES ('cccccccc-0000-0000-0000-000000000005','call:cccccccc-0000-0000-0000-000000000005:v1')$q$, 'anon INSERT');
+RESET ROLE;
+DO $$ BEGIN IF (SELECT status FROM sample_redaction_jobs WHERE id='dddddddd-0000-0000-0000-0000000000c1') <> 'failed' THEN RAISE EXCEPTION 'FAIL job changed'; END IF; END $$;
+DELETE FROM sample_redaction_jobs WHERE id='dddddddd-0000-0000-0000-0000000000c1';
+
+-- ===== #352 follow-up: browser roles never write library rows (AM/admin/anon -> 42501; SELECT kept) =====
+SET ROLE authenticated; SELECT pg_temp.as_user('22222222-0000-0000-0000-0000000000a3');   -- AM
+SELECT pg_temp.expect_42501($q$INSERT INTO training_library_calls (id) VALUES (gen_random_uuid())$q$, 'AM INSERT library call');
+SELECT pg_temp.expect_42501($q$UPDATE training_library_calls SET status = 'published'$q$, 'AM UPDATE library call (publish around the gate)');
+SELECT pg_temp.expect_42501($q$UPDATE training_library_clips SET title = 'x'$q$, 'AM UPDATE clip');
+SELECT pg_temp.expect_42501($q$INSERT INTO training_library_clips (library_call_id) VALUES (gen_random_uuid())$q$, 'AM INSERT clip');
+SELECT pg_temp.expect_42501($q$UPDATE training_library_call_sources SET consent_id = NULL$q$, 'AM UPDATE call source');
+SELECT pg_temp.expect_42501($q$INSERT INTO training_library_reviews (library_call_id, reviewer, decision, listened_full) VALUES (gen_random_uuid(), auth.uid(), 'approve', true)$q$, 'AM INSERT review');
+SELECT count(*) FROM training_library_calls;   -- SELECT still allowed (raises if not)
+SELECT pg_temp.as_user('22222222-0000-0000-0000-0000000000ad');   -- admin
+SELECT pg_temp.expect_42501($q$UPDATE training_library_calls SET status = 'published'$q$, 'admin UPDATE library call');
+RESET ROLE;
+SET ROLE anon;
+SELECT pg_temp.expect_42501($q$INSERT INTO training_library_reviews (library_call_id, reviewer, decision, listened_full) VALUES (gen_random_uuid(), gen_random_uuid(), 'approve', true)$q$, 'anon INSERT review');
 RESET ROLE;

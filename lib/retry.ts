@@ -3,6 +3,12 @@
 import { FatalError, RetryableError } from "./errors";
 
 const MAX_WAIT_MS = 60_000;
+// Poll backoff while the bridge is down: doubles from POLL_S, capped at 120 s (TrueRing's ask). Heartbeats travel
+// on the poll, so the gap between two polls (cap + 30 s request timeout) must stay well inside TR's
+// SAMPLE_WORKER_STALE_S (300 s), or a short TR outage would get running jobs failed as stale.
+export const POLL_BACKOFF_MAX_MS = 120_000;
+export const pollBackoffMs = (pollMs: number, failures: number): number =>
+  Math.min(pollMs * 2 ** Math.min(failures, 4), POLL_BACKOFF_MAX_MS);
 
 /** Resolves after `ms`, or rejects with the signal's reason as soon as it aborts. */
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {

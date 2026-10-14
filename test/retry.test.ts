@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FatalError, RetryableError } from "@/lib/errors";
-import { sleep, withRetry } from "@/lib/retry";
+import { POLL_BACKOFF_MAX_MS, pollBackoffMs, sleep, withRetry } from "@/lib/retry";
 
 describe("step retries (worker runtime)", () => {
   it("retries transient errors, then succeeds", async () => {
@@ -35,5 +35,13 @@ describe("step retries (worker runtime)", () => {
     expect(new RetryableError("x", { retryAfter: "20s" }).retryAfterMs).toBe(20_000);
     expect(new RetryableError("x", { retryAfter: "1m" }).retryAfterMs).toBe(60_000);
     expect(new RetryableError("x").retryAfterMs).toBe(10_000);
+  });
+});
+
+describe("poll backoff while the bridge is down", () => {
+  it("doubles from POLL_S and never waits more than 120 s, well inside TR's 300 s stale limit", () => {
+    expect([0, 1, 2, 3, 4, 5, 50].map((f) => pollBackoffMs(20_000, f))).toEqual([20_000, 40_000, 80_000, 120_000, 120_000, 120_000, 120_000]);
+    expect(POLL_BACKOFF_MAX_MS + 30_000).toBeLessThan(300_000);   // + the poll's own 30 s timeout
+    expect(pollBackoffMs(2_000, 0)).toBe(2_000);
   });
 });

@@ -430,6 +430,32 @@ async function main() {
     fakes.holdAsr = false;
   }
 
+  // ── 8b. the kill switch (TR d7671d64: no claims while recording_library is OFF) ──
+  sectionStart("8b. kill switch: flag recording_library OFF → no new work; a job offered just before it ends as cancelled");
+  {
+    const asBridge = async (body: Record<string, unknown>) => {
+      const raw = JSON.stringify(body);
+      const r = await fetch(BASE(PORT.bridge), { method: "POST", headers: { "x-tr-signature": signBody(SECRET.bridge, raw) }, body: raw });
+      return { status: r.status, body: (await r.json().catch(() => ({}))) as any };
+    };
+    psql(`update feature_flags set enabled = false where key = 'recording_library'`);
+    const v = q1<{ v: number }>(`select coalesce(max(version), 0) + 1 v from sample_redaction_jobs where call_id = ${lit(callId[c9])}`).v;
+    const k = JSON.parse(psql(`set role service_role; select public.sample_job_insert(${lit(callId[c9])}, ${v}, 'final_expense', ${lit(JSON.stringify({ customer_channel: M[c9].customer_channel }))}::jsonb,
+      ${lit(JSON.stringify({ duration_s: Math.round(M[c9].total_ms / 1000), vertical: "final_expense", channel_map: { customer: M[c9].customer_channel, agent: 1 - M[c9].customer_channel, verified: false } }))}::jsonb, ${lit(AM)}, 0.3, 100)`).split("\n").pop()!);
+    const jobK = String(k.job_id);
+    await sleep(8_000);   // 4 poll cycles of both workers
+    const rowK = q1(`select status, idempotency_key from sample_redaction_jobs where id = ${lit(jobK)}`);
+    check("flag OFF: a queued job is not handed to the workers", rowK.status === "queued" && !ownerOf(jobK), `status ${rowK.status}; claimed by ${ownerOf(jobK) ?? "nobody"} after 4 poll cycles`);
+    const p = await asBridge({ action: "poll", worker: "sim-probe", running: [], capacity: 2 });
+    check("flag OFF: poll offers no jobs (stop and cleanup still answer)", p.status === 200 && Array.isArray(p.body.jobs) && p.body.jobs.length === 0 && Array.isArray(p.body.stop),
+      `${p.status} jobs ${p.body.jobs?.length ?? "-"}`);
+    const cl = await asBridge({ action: "claim", job_id: jobK, run_id: "run_simprobe", idempotency_key: rowK.idempotency_key });
+    const endK = q1(`select status, error_code from sample_redaction_jobs where id = ${lit(jobK)}`);
+    check("a claim that raced the switch-off → 409 JOB_TERMINAL (the code the worker stops on, never fails) and the job ends failed:cancelled",
+      cl.status === 409 && cl.body.error_code === "JOB_TERMINAL" && endK.status === "failed" && endK.error_code === "cancelled", `${cl.status} ${cl.body.error_code}; job ${endK.status}:${endK.error_code}`);
+    psql(`update feature_flags set enabled = true where key = 'recording_library'`);
+  }
+
   // ── 9. a worker dies mid-job ──
   sectionStart("9. a worker is killed mid-job (no goodbye): the bridge fails it, the other worker cleans up, retry works");
   {

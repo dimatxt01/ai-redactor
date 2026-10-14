@@ -133,6 +133,17 @@ The TrueRing side's source of truth is now `prb/rl-worker`; it merged #347/#349 
 - **Hosting.** `deploy/docker-compose.yml` (restart unless-stopped, read-only root, tmpfs `/tmp`, json-file log rotation) and `deploy/ai-redactor.service` (systemd, `Restart=always`, the self-check before every start). ffmpeg-static is per-architecture; `npm run check` runs on the host or inside the image.
 - **Proof.** `npm run simulate`, 102 checks: hard delete (admin only, rows and files gone, spend kept in the ledger, then `NO_JOB`); cancel mid-run → stop → `vendor_purged` → delete (refused while in flight); refusal of not-ended calls and of agents with two or no verticals; a Medicare call whose prompt names Medicare; the orphan sweep. TR-side checks (`truering/check.sh`) pass on `prb/rl-worker` @ 1ea55f37.
 
+## 2026-10-13: TrueRing deployed main @ d7671d64; poll backoff capped at 120 s
+
+TrueRing merged `prb/rl-worker` into main (#351) and deployed the backend from `d7671d64`. The mirror was refreshed from it. `refresh.sh` takes a base now, because a merged branch has no merge-base diff left: `bash truering/refresh.sh <checkout> main@d7671d64 d7671d64^1`.
+- **New on TR's side:**
+  - **Kill switch.** With `recording_library` OFF, `poll` hands out no jobs (stop, lost and cleanup still run). A `claim` that raced the switch-off ends the job `failed: cancelled` and answers `409 JOB_TERMINAL`, which the worker already treats as "stop, never fail".
+  - Every `training-library-admin` write action is flag-gated except cancel, delete, sweep and withdraw.
+  - Browsers can no longer write job or library rows.
+  - None of this changes the protocol.
+- **Poll backoff capped at 120 s** (TrueRing's ask, `lib/retry.ts` `pollBackoffMs`; it was 300 s). Heartbeats travel on the poll, so a 300 s gap during a TR outage equalled `SAMPLE_WORKER_STALE_S`, and running jobs could be failed as stale. Now 120 s + the 30 s poll timeout stays well inside it.
+- **Proof.** `npm run simulate`: 105 checks. The 3 new ones cover the kill switch: no hand-out while OFF, poll offers none, and the raced claim gives `JOB_TERMINAL` with `failed: cancelled`. `truering/check.sh` passes at `d7671d64`, and so does the HMAC parity check.
+
 ## 2026-10-13: first real-vendor eval (AssemblyAI universal-3-5-pro, OpenRouter gemini-2.5-flash), and sr-2.1.0
 
 **Redaction passed on all 12 synthetic calls.** No planted value was audible in any redacted call or clip, none was left in a transcript or in coaching text, and the second pass found nothing.

@@ -134,6 +134,8 @@ Sample submit payload:
 - `fetch_expired` → retry queues the job again with the same key; the bridge's `source` hands out a fresh link.
 - **Cancel** (admin/superadmin, Dmitry 2026-10-13 1:41 PM): marks the call's queued/running jobs `failed:cancelled`; the worker aborts the run when the next poll lists it in `stop`. The worker has no cancel endpoint and nothing is deleted on its side; the run may still report spend already incurred.
 - A job running over 2 h is marked `failed:timeout`.
+- **Flag `recording_library`:** gates submit, retry, pick, link, review, publish and edit (403 `FLAG_OFF`). The bridge's `poll` hands out no jobs while OFF (`jobs: []`); stop and cleanup still run. `claim` while OFF ends a still-queued job as `failed:cancelled` (409 `JOB_TERMINAL`). Browser roles have no INSERT/UPDATE on `sample_redaction_jobs` or on the library rows (calls, call sources, clips, reviews); all those writes are service_role through the edge functions. Cancel, delete, sweep and withdraw stay ungated, so stopping and cleanup work with the flag OFF. The flag goes ON only after the worker's `check.ts --bridge` printed `"ok": true` and its alive file is fresh (≤180 s); otherwise submits sit queued and hold their cost reservation until the 2 h sweep.
+- **Deploy order:** the migration goes before the `integrity-audit` redeploy (manifest 2026-10-12.3).
 
 **Storage:**
 - RL-1 private buckets only: `sample-src/<job_id>/` (scratch, deleted when the job ends) and `training-library/<job_id>/` (results). Served only as short-lived signed URLs.

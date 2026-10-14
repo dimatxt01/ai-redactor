@@ -42,9 +42,14 @@ echo "--- RL-1's own cases on top of this migration"
   delete from calls where id::text like 'cccccccc-0000-0000-0000-00000000000%' and id::text > 'cccccccc-0000-0000-0000-000000000003'" >/dev/null
 # RL-1 cases minus the three rules this migration supersedes (Dmitry 2026-10-13 12:44 PM): the vertical CHECK now takes
 # medicare/aca (probe with an invalid vertical instead), and publish no longer needs consent (both consent-gate probes dropped).
+# Critic C1: browser roles no longer INSERT jobs, so RL-1's AM job insert runs as the owner (the edge function's role in prod);
+# its two expect_fail probes stay as AM and are now refused by privilege.
 sed -e "s/VALUES ('x','medicare')/VALUES ('x','not_a_vertical')/" \
     -e "/publish without an active consent for the source agent/d" -e "/republish while consent revoked/d" \
+    -e "s/^INSERT INTO sample_redaction_jobs (id, call_id, idempotency_key, submitted_by)$/RESET ROLE; INSERT INTO sample_redaction_jobs (id, call_id, idempotency_key, submitted_by)/" \
+    -e "s/^  VALUES ('dddddddd-0000-0000-0000-000000000001',\(.*\), auth.uid());$/  VALUES ('dddddddd-0000-0000-0000-000000000001',\1, auth.uid()); SET ROLE authenticated;/" \
     "$ROOT/supabase/tests/training_library/test.sql" > "$B/rl1_cases.sql"
+"${P[@]}" -f "$HERE/_rl1_browser_writes.sql" >/dev/null   # RL-1 cases assume RL-1 browser writes (test only)
 out="$("${P[@]}" -f "$B/rl1_cases.sql" 2>&1)" || { echo "$out" | tail -8; echo "FAIL: RL-1 cases broke on top of this migration"; exit 1; }
 echo "$out" | grep -qx " PASS" || echo "$out" | grep -q "^ PASS" || { echo "$out" | tail -5; echo "FAIL: RL-1 cases broke on top of this migration"; exit 1; }
 echo "ok: RL-1 cases pass with this migration applied"
@@ -62,6 +67,15 @@ rl1="$("${P[@]}" -At -c "select count(*) from pg_trigger where not tgisinternal 
   ('training_library_publish_gate','training_library_reviews_append_only','training_library_consent_revoked')")"
 [ "$rl1" = "3" ] || { echo "FAIL: rollback touched RL-1 triggers"; exit 1; }
 echo "ok: rollback (twice) removes everything this migration added and leaves RL-1's triggers"
+c1="$("${P[@]}" -At -c "select (select count(*) from pg_policies where tablename='sample_redaction_jobs' and policyname in ('tl_jobs_staff_insert','tl_jobs_staff_update'))
+  + has_table_privilege('authenticated','public.sample_redaction_jobs','insert')::int + has_table_privilege('authenticated','public.sample_redaction_jobs','update')::int")"
+[ "$c1" = "4" ] || { echo "FAIL: rollback did not restore RL-1's job write policies/grants ($c1)"; exit 1; }
+echo "ok: rollback restores RL-1's tl_jobs_staff_insert/update and authenticated INSERT/UPDATE"
+lib="$("${P[@]}" -At -c "select (select count(*) from pg_policies where policyname in ('tl_calls_staff_insert','tl_calls_staff_update','tl_sources_staff_insert',
+  'tl_sources_staff_update','tl_clips_staff_insert','tl_clips_staff_update','tl_reviews_staff_insert'))
+  + has_table_privilege('authenticated','public.training_library_calls','update')::int + has_table_privilege('authenticated','public.training_library_reviews','insert')::int")"
+[ "$lib" = "9" ] || { echo "FAIL: rollback did not restore RL-1's library write policies/grants ($lib)"; exit 1; }
+echo "ok: rollback restores RL-1's library write policies and grants"
 "${P[@]}" -c "truncate sample_redaction_jobs cascade" >/dev/null
 "${P[@]}" -1 -f "$M"
 echo "ok: re-apply after rollback"

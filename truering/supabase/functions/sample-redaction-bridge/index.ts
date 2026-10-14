@@ -44,6 +44,8 @@
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { verifySampleSignature } from '../_shared/sampleSignature.ts';
+import { flagEnabled } from '../_shared/featureFlags.ts';
+import { pollClaimCapacity, RL_FLAG_MAX_ERROR_STALE_MS } from '../_shared/recordingLibraryGate.ts';
 import { freshTelnyxRecordingUrl, isTelnyxRecordingUrl } from '../_shared/telnyxRecording.ts';
 
 const json = (body: unknown, status = 200) =>
@@ -137,13 +139,15 @@ Deno.serve(async (req) => {
     const cleanup = new Map<string, string[]>();
     for (const j of leftovers ?? []) cleanup.set(j.id, j.asr_transcript_ids ?? []);
 
-    // 4. queued jobs to claim, oldest first, inside the 2 h window
+    // 4. queued jobs to claim, oldest first, inside the 2 h window; none while flag recording_library is OFF
+    //    (critic C1 b). Steps 1-3 above (stop, lost, cleanup) run regardless, so cancel and cleanup still finish.
     let jobs: { job_id: string; idempotency_key: string }[] = [];
-    if (capacity > 0) {
+    const claimCap = pollClaimCapacity(capacity, await flagEnabled(supabase, 'recording_library', { maxErrorStaleMs: RL_FLAG_MAX_ERROR_STALE_MS }));
+    if (claimCap > 0) {
       const { data: q, error: qErr } = await supabase.from('sample_redaction_jobs').select('id, idempotency_key')
         .eq('status', 'queued')
         .gte('created_at', new Date(Date.now() - JOB_DEADLINE_MS).toISOString())
-        .order('created_at', { ascending: true }).limit(capacity);
+        .order('created_at', { ascending: true }).limit(claimCap);
       if (qErr) return json({ error: qErr.message, error_code: 'DB' }, 500);
       jobs = (q ?? []).map((j) => ({ job_id: j.id, idempotency_key: j.idempotency_key }));
     }
@@ -267,6 +271,17 @@ Deno.serve(async (req) => {
       return job.workflow_run_id === runId
         ? json({ ok: true, replay: true })
         : json({ error: 'job already owned by another run', error_code: 'DUPLICATE_RUN' }, 409);
+    }
+    // flag OFF (critic #352): a job offered by the last poll before the switch-off is not started. End it as cancelled
+    // (only while still queued, which frees its reservation) and answer the code the worker already treats as "stop".
+    if (!(await flagEnabled(supabase, 'recording_library', { maxErrorStaleMs: RL_FLAG_MAX_ERROR_STALE_MS }))) {
+      const { error: cancelErr } = await supabase.from('sample_redaction_jobs').update({
+        status: 'failed', error_code: 'cancelled', error_detail: 'recording_library switched off before claim',
+        completed_at: new Date().toISOString(),
+      }).eq('id', job.id).eq('status', 'queued');
+      // the job must not stay queued silently: a failed write is a 500 (the worker retries; nothing is claimed)
+      if (cancelErr) return json({ error: cancelErr.message, error_code: 'DB' }, 500);
+      return json({ error: 'the Recording Library is switched off', error_code: 'JOB_TERMINAL', status: 'failed' }, 409);
     }
     const committed = await monthCommitted();
     if (committed === null) return json({ error: 'month spend unreadable', error_code: 'DB' }, 500);

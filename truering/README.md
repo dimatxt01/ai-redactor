@@ -1,9 +1,9 @@
 # truering/: MIRROR ONLY. Never applied or deployed from here.
 
-> **The source of truth is TrueRing's own repo: `Mahamadou2004/truering`, branch `prb/rl-worker`** (later main). It holds the migration, `sample-redaction-bridge`, `training-library-admin`, the curation page, SPEC and TR_PLAN, and it goes through TrueRing's own review, migration and deploy process.
+> **The source of truth is TrueRing's own repo: `Mahamadou2004/truering`, branch `main`** (`prb/rl-worker` was merged at `d7671d64`, the deployed commit). It holds the migration, `sample-redaction-bridge`, `training-library-admin`, the curation page, SPEC and TR_PLAN, and it goes through TrueRing's own review, migration and deploy process.
 > This folder copies that branch (exact commit in [`SOURCE`](SOURCE)) so the worker's tests and `npm run simulate` can run against the real TrueRing code. It is refreshed one way, TrueRing → here, with `refresh.sh`. Never edit files here: fix them in TrueRing, then refresh.
 
-| Path | What (as it is on `prb/rl-worker`) |
+| Path | What (as it is at the commit in `SOURCE`) |
 |---|---|
 | `supabase/migrations/20261013090000_sample_redaction_worker.sql` | Extends RL-1. **Columns:** the worker, cap, `heartbeat_at` and `vertical` columns. **Functions:** `sample_job_insert` / `_retry`, `sample_library_ingest`, `sample_month_committed_usd` over the `sample_spend_ledger`, `sample_call_delete_blockers`, and `sample_call_hard_delete`. **Guard:** the column guard trigger. Rollback: `scripts/rollbacks/rollback_20261013090000_…`. |
 | `supabase/functions/sample-redaction-bridge/` | The worker's only door into TrueRing (HMAC). `poll` plus the per-job actions. |
@@ -17,7 +17,7 @@
 | RL-1 copies: `supabase/migrations/20261012180000_training_library.sql`, `supabase/tests/training_library/`, `scripts/{rollbacks,verify}/…20261012180000…` | As on TrueRing main (RL-1 is live). The tests and the simulation build on them. |
 
 ```bash
-git -C /path/to/truering fetch origin prb/rl-worker && git -C /path/to/truering checkout --detach origin/prb/rl-worker
-bash truering/refresh.sh /path/to/truering prb/rl-worker   # refresh this mirror (records the commit in SOURCE)
+git -C /path/to/truering fetch origin && git -C /path/to/truering checkout --detach <deployed commit>
+bash truering/refresh.sh /path/to/truering main@<commit> <commit>^1   # base = main before the RL merge; records the commit in SOURCE
 bash truering/check.sh   /path/to/truering                 # read-only checks INSIDE that checkout
 ```

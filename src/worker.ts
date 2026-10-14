@@ -13,7 +13,7 @@ import { deleteTranscript, listTranscriptsBetween } from "../lib/assemblyai";
 import { poll, vendorPurged } from "../lib/bridge";
 import { errorCode, log } from "../lib/log";
 import { runJob } from "../lib/job";
-import { sleep } from "../lib/retry";
+import { pollBackoffMs, sleep } from "../lib/retry";
 import { selfCheck } from "./check";
 
 const POLL_MS = Math.max(2, Number(process.env.POLL_S) || 20) * 1000;
@@ -110,8 +110,8 @@ async function main() {
       failures++;
       log("poll_failed", { code: errorCode(e), in_a_row: failures });
     }
-    // back off while the bridge is down (max 5 min); a running job keeps its own retries
-    await sleep(Math.min(POLL_MS * 2 ** Math.min(failures, 4), 300_000), stopping.signal).catch(() => {});
+    // back off while the bridge is down (max 120 s, so heartbeats stay fresh); a running job keeps its own retries
+    await sleep(pollBackoffMs(POLL_MS, failures), stopping.signal).catch(() => {});
   }
 }
 

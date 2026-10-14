@@ -19,7 +19,7 @@ C="docker compose -f /opt/ai-redactor/deploy/docker-compose.yml"
 
 ## Going live (in this order)
 
-The worker is **created but not started** until TrueRing's side is live. TrueRing's side (in `Mahamadou2004/truering` `prb/rl-worker`; each step needs its own go there) is:
+The worker is **created but not started** until TrueRing's side is live. TrueRing's side (`Mahamadou2004/truering` main; deployed at `d7671d64`; each step needs its own go there) is:
 
 1. The migration `20261013090000_sample_redaction_worker` is applied.
 2. `sample-redaction-bridge` and `training-library-admin` are deployed.
@@ -66,7 +66,7 @@ $C logs --since 1h                                 # one JSON line per event
 $C logs --since 24h | grep -E 'job_ended|job_crashed|poll_failed|cleanup_failed|orphan_sweep'
 ```
 
-- **Healthy** means a bridge poll succeeded within the last 3 minutes. The status turns `unhealthy` while TrueRing or the network is down. The worker keeps retrying on its own, at most every 5 minutes.
+- **Healthy** means a bridge poll succeeded within the last 3 minutes. The status turns `unhealthy` while TrueRing or the network is down. The worker keeps retrying on its own, at least every 2 minutes.
 - **Logs** contain ids, counts, hashes and error codes only, never names, numbers or transcript text. They rotate at 30 MB in total.
 - **Events:**
   - `worker_up`: start.

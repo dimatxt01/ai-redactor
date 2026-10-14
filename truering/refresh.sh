@@ -3,11 +3,13 @@
 # One direction only: TrueRing → here. Nothing in truering/ is ever applied or deployed from this repo.
 #
 #   git -C /path/to/truering fetch origin prb/rl-worker && git -C /path/to/truering checkout --detach origin/prb/rl-worker
-#   bash truering/refresh.sh /path/to/truering [prb/rl-worker]   # copies FILES + SPEC + TR_PLAN + RL-1 copies, regenerates the patch
+#   bash truering/refresh.sh /path/to/truering [label] [base]   # copies FILES + SPEC + TR_PLAN + RL-1 copies, regenerates the patch
+# base: where the RL worker work starts. Default: merge-base with origin/main (a branch). Once merged, pass main
+# before the merge, e.g. `bash truering/refresh.sh ~/truering main@d7671d64 d7671d64^1`.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TR="$(cd "${1:?usage: bash truering/refresh.sh /path/to/truering}" && pwd)"
-base="$(git -C "$TR" merge-base HEAD origin/main)"
+base="$(git -C "$TR" rev-parse "${3:-$(git -C "$TR" merge-base HEAD origin/main)}")"
 git -C "$TR" diff --name-only --diff-filter=A "$base" HEAD > "$HERE/FILES"
 copy() { mkdir -p "$HERE/$(dirname "$1")"; git -C "$TR" show "HEAD:$1" > "$HERE/$1"; }
 while IFS= read -r f; do copy "$f"; done < "$HERE/FILES"

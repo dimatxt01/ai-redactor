@@ -11,6 +11,8 @@
 //   pick     {min_s?, max_s?, agent_id?}      ENDED Sale calls (status completed + ended_at) with a Telnyx recording, every vertical, newest 300.
 //                                             Server-side because calls RLS limits an AM to their own book, and AM
 //                                             curation is global (Dmitry 2026-10-12 6:47 PM CT).
+//   (flag)   submit, retry, pick, link, review, publish, edit need flag recording_library ON (403 FLAG_OFF);
+//            cancel, delete, sweep, withdraw work with the flag OFF.
 //   submit   {call_id, options, reprocess?}   flag recording_library ON; ended Sale, Telnyx, 60–3600 s, any vertical (resolved
 //                                             from the call's agent; refused if it cannot be resolved), no consent requirement
 //                                             (Dmitry 12:44 PM); idempotent per call:<id>:v<n>; reserves the estimate; queues the job
@@ -45,6 +47,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { isTelnyxRecordingUrl } from '../_shared/telnyxRecording.ts';
 import { stateFromNumber } from '../_shared/npaState.ts';
 import { flagEnabled } from '../_shared/featureFlags.ts';
+import { RL_FLAG_MAX_ERROR_STALE_MS, recordingLibraryGate } from '../_shared/recordingLibraryGate.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -157,6 +160,11 @@ Deno.serve(async (req) => {
     return data;
   };
 
+  // Flag gate (tr cos 2:14 PM): submit, retry, pick, link, review, publish, edit need recording_library ON;
+  // cancel, delete, sweep, withdraw stay ungated so stopping and cleanup work with the flag OFF.
+  const gate = await recordingLibraryGate(action, () => flagEnabled(admin, 'recording_library', { maxErrorStaleMs: RL_FLAG_MAX_ERROR_STALE_MS }));
+  if (gate) return json(gate, 403);
+
   switch (action) {
     case 'pick': {
       const minS = Math.max(60, Math.min(3600, Number(body.min_s) || 600));
@@ -183,9 +191,6 @@ Deno.serve(async (req) => {
     }
 
     case 'submit': {
-      if (!(await flagEnabled(admin, 'recording_library'))) {
-        return json({ error: 'the Recording Library is switched off (flag recording_library)', error_code: 'FLAG_OFF' }, 403);
-      }
       const callId = String(body.call_id ?? '');
       if (!UUID_RE.test(callId)) return json({ error: 'call_id required', error_code: 'BAD_CALL_ID' }, 400);
 

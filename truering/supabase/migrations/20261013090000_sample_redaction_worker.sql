@@ -364,6 +364,29 @@ BEGIN
 END
 $fn$;
 
+-- ── 5c. browser roles never write jobs (critic C1, 2026-10-13) ───────────────
+-- RL-1 let authenticated staff (incl. AMs) INSERT/UPDATE sample_redaction_jobs directly, which bypassed the flag, the
+-- submit rules and the reservation (status/vertical/options/call_meta/idempotency_key are not service columns).
+-- Every job write goes through training-library-admin / the bridge with service_role; the frontend only SELECTs jobs.
+DROP POLICY IF EXISTS tl_jobs_staff_insert ON public.sample_redaction_jobs;
+DROP POLICY IF EXISTS tl_jobs_staff_update ON public.sample_redaction_jobs;
+REVOKE INSERT, UPDATE ON public.sample_redaction_jobs FROM anon, authenticated;
+
+-- ── 5d. browser roles never write library rows (critic #352 follow-up) ──────
+-- RL-1 let staff INSERT/UPDATE training_library_calls / _call_sources / _clips and INSERT reviews directly, which went
+-- around the flag gate of pick/link/review/publish/edit. Every library write is service_role in training-library-admin
+-- (or sample_library_ingest); the frontend only SELECTs these tables. Ratings and consents are untouched.
+DROP POLICY IF EXISTS tl_calls_staff_insert ON public.training_library_calls;
+DROP POLICY IF EXISTS tl_calls_staff_update ON public.training_library_calls;
+DROP POLICY IF EXISTS tl_sources_staff_insert ON public.training_library_call_sources;
+DROP POLICY IF EXISTS tl_sources_staff_update ON public.training_library_call_sources;
+DROP POLICY IF EXISTS tl_clips_staff_insert ON public.training_library_clips;
+DROP POLICY IF EXISTS tl_clips_staff_update ON public.training_library_clips;
+DROP POLICY IF EXISTS tl_reviews_staff_insert ON public.training_library_reviews;
+REVOKE INSERT, UPDATE ON public.training_library_calls, public.training_library_call_sources, public.training_library_clips
+  FROM anon, authenticated;
+REVOKE INSERT ON public.training_library_reviews FROM anon, authenticated;
+
 -- ── 6. self-check ──────────────────────────────────────────────────────────
 DO $verify$
 BEGIN
@@ -376,6 +399,19 @@ BEGIN
   IF (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgenabled = 'O'
        AND tgname = 'sample_redaction_jobs_service_columns') <> 1 THEN
     RAISE EXCEPTION 'VERIFY FAIL: trigger missing or disabled';
+  END IF;
+  IF has_table_privilege('authenticated', 'public.sample_redaction_jobs', 'insert') OR has_table_privilege('authenticated', 'public.sample_redaction_jobs', 'update')
+     OR has_table_privilege('anon', 'public.sample_redaction_jobs', 'insert') OR has_table_privilege('anon', 'public.sample_redaction_jobs', 'update')
+     OR EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'sample_redaction_jobs' AND cmd <> 'SELECT')
+     OR NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'sample_redaction_jobs' AND policyname = 'tl_jobs_staff_select') THEN
+    RAISE EXCEPTION 'VERIFY FAIL: a browser role can still write sample_redaction_jobs (or staff SELECT is gone)';
+  END IF;
+  IF EXISTS (SELECT 1 FROM unnest(ARRAY['training_library_calls','training_library_call_sources','training_library_clips','training_library_reviews']) t
+              CROSS JOIN unnest(ARRAY['anon','authenticated']) r
+              WHERE has_table_privilege(r, 'public.' || t, 'insert') OR has_table_privilege(r, 'public.' || t, 'update'))
+     OR EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND cmd <> 'SELECT'
+                 AND tablename IN ('training_library_calls','training_library_call_sources','training_library_clips','training_library_reviews')) THEN
+    RAISE EXCEPTION 'VERIFY FAIL: a browser role can still write library rows';
   END IF;
   IF has_table_privilege('anon', 'public.sample_spend_ledger', 'select') OR has_table_privilege('authenticated', 'public.sample_spend_ledger', 'select')
      OR NOT (SELECT relrowsecurity FROM pg_class WHERE oid = 'public.sample_spend_ledger'::regclass) THEN
