@@ -133,8 +133,8 @@ export async function pitchShiftPcm(pcm: Int16Array, dir: string): Promise<Pitch
 /**
  * The redacted mono mix: PII silenced on both legs on the ORIGINAL timeline
  * (where AssemblyAI's timestamps are true), customer leg optionally
- * pitch-shifted, legs summed with a hard ceiling, then the tone laid over every
- * interval. Returns 16 kHz mono s16.
+ * pitch-shifted, legs summed with a hard ceiling, then the bleep (soft pink noise)
+ * laid over every interval. Returns 16 kHz mono s16.
  */
 export async function renderRedacted(src: string, dir: string, bleeps: Interval[], opts: { customerChannel: 0 | 1; pitch: boolean }): Promise<{ pcm: Int16Array; engine: PitchEngine }> {
   const [ch0, ch1] = await decodeChannels(src, dir);
@@ -153,23 +153,56 @@ export async function renderRedacted(src: string, dir: string, bleeps: Interval[
   return { pcm: mix, engine };
 }
 
-/** Replace every interval with a 1 kHz tone at -12 dBFS (5 ms raised-cosine ramps on the tone only). In place. */
+/** Seeded uniform PRNG in [-1, 1) (mulberry32): the same intervals always render the same noise. */
+function noiseSource(seed: number): () => number {
+  let t = seed >>> 0;
+  return () => {
+    t = (t + 0x6d2b79f5) >>> 0;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return (((r ^ (r >>> 14)) >>> 0) / 4294967296) * 2 - 1;
+  };
+}
+
+/** n samples of pink noise (Paul Kellet's economy filter, warmed up first), scaled to `rms`. */
+export function pinkNoise(n: number, rms: number, seed: number): Float64Array {
+  const white = noiseSource(seed);
+  let b0 = 0, b1 = 0, b2 = 0;
+  const step = () => {
+    const w = white();
+    b0 = 0.99765 * b0 + w * 0.099046;
+    b1 = 0.963 * b1 + w * 0.2965164;
+    b2 = 0.57 * b2 + w * 1.0526913;
+    return b0 + b1 + b2 + w * 0.1848;
+  };
+  for (let k = 0; k < 4000; k++) step();   // past the filter's start-up
+  const out = new Float64Array(n);
+  let sq = 0;
+  for (let k = 0; k < n; k++) { out[k] = step(); sq += out[k] * out[k]; }
+  const g = n ? rms / Math.sqrt(sq / n || 1) : 0;
+  for (let k = 0; k < n; k++) out[k] *= g;
+  return out;
+}
+
+/** Replace every interval with soft pink noise at BLEEP.rmsDbfs (raised-cosine fades on the noise only). In place. */
 export function bleepPcm(pcm: Int16Array, sr: number, intervals: Interval[]): number {
-  const amp = Math.pow(10, BLEEP.dbfs / 20) * 32767;
+  const rms = Math.pow(10, BLEEP.rmsDbfs / 20) * 32767;
   const fade = Math.max(1, Math.round((BLEEP.edgeFadeMs / 1000) * sr));
   let samples = 0;
-  for (const iv of intervals) {
+  intervals.forEach((iv, i) => {
     const a = Math.max(0, Math.floor((iv.start_ms / 1000) * sr));
     const b = Math.min(pcm.length, Math.ceil((iv.end_ms / 1000) * sr));
     const n = Math.max(0, b - a);
+    const noise = pinkNoise(n, rms, BLEEP.seed + i);
     for (let k = 0; k < n; k++) {
       const edge = Math.min(k, n - 1 - k);
       const g = edge < fade ? 0.5 - 0.5 * Math.cos((Math.PI * edge) / fade) : 1;
-      // the interval's original samples are dropped entirely; only the tone ramps in and out
-      pcm[a + k] = Math.round(Math.sin((2 * Math.PI * BLEEP.toneHz * k) / sr) * amp * g);
+      // the interval's original samples are dropped entirely; only the noise fades in and out
+      const v = Math.round(noise[k] * g);
+      pcm[a + k] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
     }
     samples += n;
-  }
+  });
   return samples;
 }
 

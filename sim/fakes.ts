@@ -2,7 +2,7 @@
 //   /storage/v1/object/...   Supabase Storage signed URLs (files on disk; tokens from fake-supabase.ts)
 //   /telnyx/v2/recordings/…  Telnyx "fresh recording link" API → /recordings/<id>.mp3 (the test call)
 //   /aai/v2/transcript…      AssemblyAI: words from the test call's script, entities for its planted values;
-//                            the verification pass LISTENS to the redacted mp3 (1 kHz tone detection) and only
+//                            the verification pass LISTENS to the redacted mp3 (bleep-noise detection) and only
 //                            returns words that are still audible, the way a real transcriber would
 //   /openrouter/api/v1/…     OpenRouter: no extra PII labels; a valid clips + coaching answer (invalid on each
 //                            job's first try, so the worker's one retry-with-the-error is exercised)
@@ -13,6 +13,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import ffmpegPath from "ffmpeg-static";
+import { BLEEP } from "../lib/config";
 
 export type Manifest = {
   name: string; customer_channel: 0 | 1; agent: string; caller: string; strict: boolean;
@@ -58,21 +59,63 @@ export function decodeStereo(file: string): [Float32Array, Float32Array] {
   return [l, r];
 }
 
-/** Share of the window's energy in the 1 kHz bleep tone (Goertzel). ~1 = bleeped, ~0 = speech or silence. */
-export function toneShare(x: Float32Array, startMs: number, endMs: number): number {
-  const sr = 16000;
-  // the middle 60% of the word: edges can hold the fade
-  const a = Math.max(0, Math.floor(((startMs + (endMs - startMs) * 0.2) / 1000) * sr));
-  const b = Math.min(x.length, Math.floor(((endMs - (endMs - startMs) * 0.2) / 1000) * sr));
-  const n = b - a;
-  if (n < 64) return 0;
-  const k = Math.round((n * 1000) / sr), w = (2 * Math.PI * k) / n, c = 2 * Math.cos(w);
-  let s1 = 0, s2 = 0, energy = 0;
-  for (let i = a; i < b; i++) { const s0 = x[i] + c * s1 - s2; s2 = s1; s1 = s0; energy += x[i] * x[i]; }
-  const power = s1 * s1 + s2 * s2 - c * s1 * s2;
-  if (energy < 1e-6 * n) return 0;   // silence
-  return Math.min(1, (2 * power) / (n * energy));
+/** In-place radix-2 FFT (n a power of two). */
+function fft(re: Float64Array, im: Float64Array): void {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const ar = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, ai = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+        re[i + k + len / 2] = re[i + k] - ar; im[i + k + len / 2] = im[i + k] - ai;
+        re[i + k] += ar; im[i + k] += ai;
+        [cr, ci] = [cr * wr - ci * wi, cr * wi + ci * wr];
+      }
+    }
+  }
 }
+
+const FRAME = 512, HOP = 256, SR = 16000;
+const HANN = Float64Array.from({ length: FRAME }, (_, k) => 0.5 - 0.5 * Math.cos((2 * Math.PI * k) / FRAME));
+const BAND = [Math.round((300 * FRAME) / SR), Math.round((3400 * FRAME) / SR)] as const;
+
+/** A word's sound, from 32 ms frames over its middle 60% (its edges can hold a fade): the spectral flatness of the
+ *  frame-averaged spectrum in 300–3400 Hz after undoing pink's 1/f slope (noise ≈ 1, speech low: its energy sits in
+ *  harmonics and formants), the mean level and how much the level moves from frame to frame (noise is steady). */
+export function wordSound(x: Float32Array, startMs: number, endMs: number): { flat: number; db: number; dbStd: number } {
+  const a = Math.max(0, Math.floor(((startMs + (endMs - startMs) * 0.2) / 1000) * SR));
+  const b = Math.min(x.length, Math.floor(((endMs - (endMs - startMs) * 0.2) / 1000) * SR));
+  const psd = new Float64Array(BAND[1] - BAND[0] + 1);
+  const dbs: number[] = [];
+  for (let at = a; at + FRAME <= b || (dbs.length === 0 && at < b); at += HOP) {
+    const re = new Float64Array(FRAME), im = new Float64Array(FRAME);
+    let sq = 0;
+    for (let k = 0; k < FRAME; k++) { const v = x[at + k] ?? 0; sq += v * v; re[k] = v * HANN[k]; }
+    fft(re, im);
+    for (let bin = BAND[0]; bin <= BAND[1]; bin++) psd[bin - BAND[0]] += (re[bin] * re[bin] + im[bin] * im[bin]) * bin;
+    dbs.push(10 * Math.log10(sq / FRAME + 1e-20));
+  }
+  let logSum = 0, sum = 0;
+  for (const p of psd) { logSum += Math.log(p + 1e-20); sum += p; }
+  const db = dbs.reduce((s, v) => s + v, 0) / dbs.length;
+  return { flat: Math.exp(logSum / psd.length) / (sum / psd.length + 1e-20), db, dbStd: Math.sqrt(dbs.reduce((s, v) => s + (v - db) ** 2, 0) / dbs.length) };
+}
+
+/** 1 = the word is under the bleep (soft pink noise), 0 = speech or silence. Measured on the test calls
+ *  (mp3 → 16 kHz stereo decode): noise flatness ≥ 0.88, speech ≤ 0.60. The level only rules out digital silence
+ *  (flat by definition) and loud sounds: a clip's 1 s fade-in or fade-out turns the noise down, not less flat. */
+export function bleepShare(x: Float32Array, startMs: number, endMs: number): number {
+  const w = wordSound(x, startMs, endMs);
+  return w.flat > BLEEP_FLAT && w.db > -70 && w.db < BLEEP.rmsDbfs + 4 ? 1 : 0;
+}
+export const BLEEP_FLAT = 0.75;
 export const BLEEPED = 0.5;
 
 type Transcript = Record<string, unknown> & { id: string; job: string; pass: 1 | 2 };
@@ -217,7 +260,7 @@ export class Fakes {
         writeFileSync(tmp, file.bytes);
         const chans = decodeStereo(tmp);
         const words = wordsOf(fx);
-        const audible = (w: Word) => toneShare(chans[w.ch], w.start, w.end) < BLEEPED;
+        const audible = (w: Word) => bleepShare(chans[w.ch], w.start, w.end) < BLEEPED;
         const kept = words.filter(audible);
         const entities = fx.planted.filter((x) => ENTITY[x.kind]).flatMap((x) => {
           const ws = plantedWords(fx, words, x).filter(audible);

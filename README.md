@@ -76,7 +76,7 @@ Prerequisites: Node 22 and PostgreSQL 15+ (`brew install postgresql@17`). Deno c
 
 **`npm run simulate`** runs the real code on both sides:
 - **Real:** two worker processes, TrueRing's `training-library-admin` and `sample-redaction-bridge` (from the mirror, unchanged, under Deno), and the RL-1 + worker migrations on a throwaway Postgres.
-- **Faked:** only Supabase's HTTP layer, Telnyx, AssemblyAI and OpenRouter. On the verification pass, the fake AssemblyAI listens to the redacted mp3 for the bleep tone, so an unbleeped value stays audible.
+- **Faked:** only Supabase's HTTP layer, Telnyx, AssemblyAI and OpenRouter. On the verification pass, the fake AssemblyAI listens to the redacted mp3 for the bleep noise (a noise-flat spectrum), so an unbleeped value stays audible.
 
 It checks, from TrueRing's side (105 checks):
 1. **Auth:** wrong secrets are refused; a worker with a wrong secret refuses to start.

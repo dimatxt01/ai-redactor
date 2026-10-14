@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { signBody } from "../lib/signature";
 import { CLIP_LABELS, NO_AUDIO_LABELS, PIPELINE_VERSION, SCHEMA_VERSION } from "../lib/config";
-import { BLEEPED, decodeStereo, Fakes, plantedWords, toneShare, wordsOf, type Manifest } from "./fakes";
+import { BLEEPED, bleepShare, decodeStereo, Fakes, plantedWords, wordsOf, type Manifest } from "./fakes";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const TR = path.join(ROOT, "truering");
@@ -164,7 +164,7 @@ function audibleValues(file: string, m: Manifest, fromMs = 0, toMs = Infinity): 
   const out: string[] = [];
   for (const p of m.planted) {
     const ws = plantedWords(m, words, p).filter((w) => w.start >= fromMs && w.end <= toMs);
-    const heard = ws.filter((w) => toneShare(chans[w.ch], w.start - fromMs, w.end - fromMs) < BLEEPED);
+    const heard = ws.filter((w) => bleepShare(chans[w.ch], w.start - fromMs, w.end - fromMs) < BLEEPED);
     if (heard.length) out.push(`${p.kind} "${heard.map((w) => w.text).join(" ")}" @${heard[0].start}ms`);
   }
   return out;
@@ -409,6 +409,8 @@ async function main() {
     const job = String(s8.body.job_id);
     const mid = await waitJob(job, (st) => st === "transcribing", 60_000);
     const vendor = () => [...fakes.transcripts.values()].filter((t) => t.job === job);
+    // the status turns 'transcribing' just before the upload reaches the vendor
+    for (let i = 0; i < 30 && vendor().length === 0; i++) await sleep(500);
     check("job is mid-run (transcribing; AssemblyAI has a copy)", mid.status === "transcribing" && vendor().length === 1, `${mid.seen.join(" → ")}; vendor copies ${vendor().length}`);
     const early = await asStaff(ADMIN, { action: "delete", call_id: callId.cancel });
     check("delete while in flight → 409 IN_FLIGHT (cancel first)", early.status === 409 && early.body.error_code === "IN_FLIGHT", `${early.status} ${early.body.error_code} ${early.body.error ?? ""}`);
@@ -565,13 +567,13 @@ async function verifyDone(job: string, m: Manifest, fakes: Fakes) {
   check("AssemblyAI copies deleted when the job finished", asr.length >= 2 && asr.every((t) => fakes.deleted.has(t.id)), `${asr.filter((t) => fakes.deleted.has(t.id)).length}/${asr.length} deleted`);
   check("cost recorded once per item, under the $2 job cap", j.cost_usd > 0 && j.cost_usd <= 2 && Object.keys(j.items ?? {}).length > 0, `$${j.cost_usd} (${Object.keys(j.items ?? {}).length} items)`);
 
-  // listen: every planted value under the bleep tone, in the full call and in every exported clip
+  // listen: every planted value under the bleep noise, in the full call and in every exported clip
   const red = path.join(STORAGE, "training-library", job, "redacted.mp3");
   // control: the same listener on the ORIGINAL recording must hear every planted value
   const original = audibleValues(path.join(ROOT, "fixtures", "out", `${m.name}.mp3`), m);
   check("control: the listener hears every planted value in the original recording", original.length === m.planted.length, `${original.length}/${m.planted.length}`);
   const heard = audibleValues(red, m);
-  check(`audio: all ${m.planted.length} planted values bleeped in the redacted call`, heard.length === 0, heard.slice(0, 4).join("; ") || "1 kHz tone over every planted word");
+  check(`audio: all ${m.planted.length} planted values bleeped in the redacted call`, heard.length === 0, heard.slice(0, 4).join("; ") || "bleep noise over every planted word");
   let clipLeaks: string[] = [];
   for (const c of clips.filter((x) => x.audio_exported)) {
     const f = path.join(STORAGE, "training-library", c.audio_path);

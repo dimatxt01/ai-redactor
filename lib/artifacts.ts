@@ -33,7 +33,7 @@ export function redactedLines(t: Transcript, spans: Span[], bleeps: Interval[], 
   const typeAt = (start: number, end: number, i: number): string | null => {
     const own = padded.find(({ s }) => i >= s.from && i <= s.to && t.words[i].ch === s.channel);
     if (own) return own.s.type;
-    // not PII itself: hidden only when it is mostly under the tone (its midpoint is bleeped)
+    // not PII itself: hidden only when it is mostly under the bleep (its midpoint is bleeped)
     const mid = (start + end) / 2;
     if (!bleeps.some((b) => mid >= b.start_ms && mid <= b.end_ms)) return null;
     return padded.find(({ iv }) => mid >= iv.start_ms && mid <= iv.end_ms)?.s.type ?? "BLEEP";

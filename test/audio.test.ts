@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { cutClip, encodeMp3, pitchShiftPcm, probe, renderRedacted, writePcm, WORK_SR } from "@/lib/audio";
+import { bleepPcm, cutClip, encodeMp3, pitchShiftPcm, probe, renderRedacted, writePcm, WORK_SR } from "@/lib/audio";
 
 let dir = "";
 beforeAll(async () => { dir = await mkdtemp(path.join(tmpdir(), "sr-audio-")); });
@@ -46,12 +46,11 @@ const SRC = path.join(import.meta.dirname, "..", "fixtures", "out", "01-classic-
     expect(["rubberband", "resample"]).toContain(engine);
     expect(Math.abs((pcm.length / WORK_SR) * 1000 - p.durationMs)).toBeLessThan(200);   // mp3 decoder delay only
 
-    // inside the bleep the mix is exactly the tone (deterministic), i.e. nothing of either leg
+    // inside the bleep the mix is exactly the bleep noise (seeded), i.e. nothing of either leg
+    const ref = new Int16Array(pcm.length);
+    bleepPcm(ref, WORK_SR, bleeps);
     const a = 10_000 * WORK_SR / 1000;
-    for (let k = 200; k < 31_000; k += 997) {
-      const tone = Math.round(Math.sin((2 * Math.PI * 1000 * k) / WORK_SR) * Math.pow(10, -12 / 20) * 32767);
-      expect(pcm[a + k]).toBe(tone + 0);   // Int16Array has no -0
-    }
+    for (let k = 0; k < 32_000; k++) expect(pcm[a + k]).toBe(ref[a + k]);
 
     const pcmFile = path.join(dir, "m.pcm");
     await writePcm(pcmFile, pcm);

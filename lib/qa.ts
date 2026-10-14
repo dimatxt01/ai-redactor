@@ -56,7 +56,7 @@ export function firstPassReasons(p: {
 
 /**
  * Second pass on the REDACTED audio's transcript: anything the detectors still
- * find outside a bleep is a leak. Hits inside a bleep are the tone being misheard.
+ * find outside a bleep is a leak. Hits inside a bleep are the bleep noise being misheard.
  */
 export function secondPassReasons(
   t2: Transcript,

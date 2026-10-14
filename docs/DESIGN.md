@@ -19,7 +19,7 @@ Paths below are in this repo; TrueRing-side files live under `truering/` at thei
 5. **render**:
    - PII is silenced on both legs **on the source timeline**.
    - The pitch shift is optional and **off by default** (v0.2).
-   - Then a mono mix, with a 1 kHz −12 dBFS tone over every interval (250 ms pad, spans under 500 ms apart merged).
+   - Then a mono mix, with soft pink noise (a gentle "shh", −30 dBFS RMS, 30 ms fades, seeded) over every interval (250 ms pad, spans under 500 ms apart merged). Until sr-2.1.0 this was a 1 kHz −12 dBFS tone.
    - Encoded as mp3 44.1 kHz/128 kbps.
 6. **transcript files**:
    - `transcript.json` and `transcript.txt`, with `[REDACTED:TYPE]` in place of PII;
@@ -132,6 +132,16 @@ The TrueRing side's source of truth is now `prb/rl-worker`; it merged #347/#349 
 - **New: AssemblyAI orphan sweep.** The new crash scenario showed it was needed: a worker killed between AssemblyAI's submit and the bridge `asr` record leaves a transcript whose id TR never learns. It would sit at the vendor forever, and it doesn't block a delete, since the row shows no ids. Every `ORPHAN_SWEEP_S` (1800) the worker lists its account's transcripts and deletes those older than `ORPHAN_AGE_S` (8100 = 2 h 15 m, past the 2 h job deadline), never touching ids of its own running jobs. This requires an AssemblyAI key used by this worker only. Tests: `test/assemblyai-list.test.ts`, plus a deterministic simulation case.
 - **Hosting.** `deploy/docker-compose.yml` (restart unless-stopped, read-only root, tmpfs `/tmp`, json-file log rotation) and `deploy/ai-redactor.service` (systemd, `Restart=always`, the self-check before every start). ffmpeg-static is per-architecture; `npm run check` runs on the host or inside the image.
 - **Proof.** `npm run simulate`, 102 checks: hard delete (admin only, rows and files gone, spend kept in the ledger, then `NO_JOB`); cancel mid-run → stop → `vendor_purged` → delete (refused while in flight); refusal of not-ended calls and of agents with two or no verticals; a Medicare call whose prompt names Medicare; the orphan sweep. TR-side checks (`truering/check.sh`) pass on `prb/rl-worker` @ 1ea55f37.
+
+## 2026-10-14: sr-2.2.0, a soft "shh" instead of a beep (Dmitry)
+
+The bleep is now soft pink noise, not the 1 kHz −12 dBFS tone.
+- **Level and shape:** −30 dBFS RMS (18 dB quieter than the tone), 30 ms raised-cosine fades.
+- **Reproducible:** the noise is seeded per interval (`lib/audio.ts` `pinkNoise`), so one render always gives the same bytes.
+- **Same privacy rule:** the original samples under a bleep are dropped; nothing of the speech is mixed in.
+- **TrueRing:** its SPEC §2 line "Replace each span with a 1 kHz tone at −12 dBFS" must change in TrueRing's repo; the mirror is never edited here. No TR code reads the sound.
+- **Simulation:** the fake listener detects the noise by the flatness of the word's averaged spectrum, once pink's 1/f slope is undone, instead of by Goertzel at 1 kHz. Calibrated on 4 test calls: noise ≥ 0.88, speech ≤ 0.60, threshold 0.75; 860 spoken words read as speech, 207 bleeped words read as bleeped. The level only rules out digital silence, so a clip's fade does not hide the noise. 105/105.
+- **Also fixed:** a race in simulation §8, which checked for the vendor copy a moment before the upload reached the fake vendor.
 
 ## 2026-10-13: TrueRing deployed main @ d7671d64; poll backoff capped at 120 s
 

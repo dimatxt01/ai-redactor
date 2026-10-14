@@ -11,18 +11,32 @@ import { fromAssemblyAi } from "@/lib/words";
 import { script } from "./helpers";
 
 describe("bleep DSP", () => {
-  it("replaces speech with a -12 dBFS 1 kHz tone and leaves the rest untouched", () => {
+  it("replaces speech with soft pink noise at -30 dBFS RMS, fades it, and leaves the rest untouched", () => {
     const sr = 16000;
     const pcm = new Int16Array(sr * 2).fill(20000);   // loud "speech"
     bleepPcm(pcm, sr, [{ start_ms: 500, end_ms: 1500 }]);
-    const inside = pcm.slice(sr * 0.6, sr * 1.4);
-    const peak = Math.max(...Array.from(inside, Math.abs));
-    expect(peak).toBeGreaterThan(8000);
-    expect(peak).toBeLessThanOrEqual(Math.ceil(Math.pow(10, -12 / 20) * 32767));
+    const inside = Array.from(pcm.slice(sr * 0.6, sr * 1.4));
+    const rmsDb = 20 * Math.log10(Math.sqrt(inside.reduce((s, v) => s + v * v, 0) / inside.length) / 32767);
+    expect(rmsDb).toBeGreaterThan(-31);
+    expect(rmsDb).toBeLessThan(-29);
+    expect(Math.max(...inside.map(Math.abs))).toBeLessThan(Math.pow(10, -10 / 20) * 32767);   // soft: no peak near full scale
+    expect(Math.abs(pcm[sr * 0.5])).toBeLessThan(50);    // fades in from silence
     expect(pcm[sr * 0.25]).toBe(20000);
     expect(pcm[sr * 1.75]).toBe(20000);
     // no original sample survives inside the interval
     expect(Array.from(pcm.slice(sr * 0.5, sr * 1.5)).some((v) => v === 20000)).toBe(false);
+  });
+
+  it("is reproducible (seeded) and pink: more energy low than high", () => {
+    const sr = 16000, iv = [{ start_ms: 0, end_ms: 2000 }];
+    const a = new Int16Array(sr * 2), b = new Int16Array(sr * 2).fill(123);
+    bleepPcm(a, sr, iv);
+    bleepPcm(b, sr, iv);
+    expect(Array.from(a)).toEqual(Array.from(b));
+    // first difference ~ high frequencies: for pink noise its energy is well below the signal's own
+    let e = 0, d = 0;
+    for (let k = 1; k < a.length; k++) { e += a[k] * a[k]; d += (a[k] - a[k - 1]) ** 2; }
+    expect(d / e).toBeLessThan(1);   // white noise gives ~2
   });
 });
 

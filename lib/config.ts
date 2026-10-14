@@ -3,7 +3,7 @@
 // one is a pipeline change: bump PIPELINE_VERSION with it, so every result says
 // which pipeline produced it.
 
-export const PIPELINE_VERSION = "sr-2.1.0";   // 2.0: SPEC v0.2 clip taxonomy, smart clips, fe_v1 coaching · 2.1: clip cap by length, clips repaired/dropped one by one, preferred LLM provider
+export const PIPELINE_VERSION = "sr-2.2.0";   // 2.0: SPEC v0.2 clip taxonomy, smart clips, fe_v1 coaching · 2.1: clip cap by length, clips repaired/dropped one by one, preferred LLM provider · 2.2: soft pink-noise bleep
 
 // Output schema (SPEC v0.2 §7): adding fields = minor, renaming/removing = major (30 days side by side).
 export const SCHEMA_VERSION = "1.0";
@@ -23,11 +23,13 @@ export const LIMITS = {
   asrWaitMinutes: 90,              // per ASR pass, inside the job deadline
 } as const;
 
+// The bleep: soft pink noise (a gentle "shh") instead of a beep (Dmitry, 2026-10-14). Seeded, so a render is
+// reproducible; the original samples under it are dropped, never mixed in.
 export const BLEEP = {
-  toneHz: 1000,
-  dbfs: -12,
+  rmsDbfs: -30,        // the noise's level (RMS); speech on a call sits around -20 to -26 dBFS
+  seed: 0x5eed,
   mergeGapMs: 500,
-  edgeFadeMs: 5,
+  edgeFadeMs: 30,      // raised-cosine in and out
 } as const;
 
 export const QA = {
